@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import uuid
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,14 +49,15 @@ def verify_generated_project(workspace_path: str, role: str) -> VerificationRepo
         verify_workspace_layout(workspace),
         verify_no_external_file_references(workspace),
         verify_contract_exists(workspace),
+        verify_e2e_steps_declared(workspace),
         scan_for_shortcuts(workspace),
+        verify_backend_dependency_manifest(workspace),
         verify_generated_tests(workspace),
     ]
 
     if role == "E2E_VERIFIER":
         checks.extend(
             [
-                verify_e2e_steps_declared(workspace),
                 verify_frontend_build(workspace),
                 verify_contract_e2e(workspace),
             ]
@@ -224,6 +226,20 @@ def verify_e2e_steps_declared(workspace: Path) -> VerificationReport:
                 findings.append(f"step {index}: missing {key}")
         if "assertions" in step and not isinstance(step["assertions"], list):
             findings.append(f"step {index}: assertions must be an array")
+        for assertion_index, assertion in enumerate(step.get("assertions", []), start=1):
+            if not isinstance(assertion, dict):
+                findings.append(f"step {index} assertion {assertion_index}: must be an object")
+                continue
+            path = assertion.get("path")
+            if path is not None and not (isinstance(path, str) and (path.startswith("$.") or path.startswith("$[*]."))):
+                findings.append(
+                    f"step {index} assertion {assertion_index}: unsupported path {path!r}; "
+                    "use $.field or $[*].field"
+                )
+        if "headers" in step and not isinstance(step["headers"], dict):
+            findings.append(f"step {index}: headers must be an object")
+        if "captures" in step and not isinstance(step["captures"], dict):
+            findings.append(f"step {index}: captures must be an object")
 
     endpoints = contract.get("endpoints", [])
     endpoint_pairs = {
@@ -254,6 +270,17 @@ def verify_e2e_steps_declared(workspace: Path) -> VerificationReport:
         }
         for case_name in sorted(declared_negative_cases - covered_negative_cases):
             findings.append(f"no e2e_steps coverage for negative case {case_name}")
+
+    captured_names = {
+        str(name)
+        for step in steps
+        if isinstance(step, dict) and isinstance(step.get("captures"), dict)
+        for name in step["captures"]
+    }
+    serialized_headers = json.dumps([step.get("headers", {}) for step in steps if isinstance(step, dict)])
+    for placeholder in sorted(set(re.findall(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", serialized_headers))):
+        if "token" in placeholder.lower() and placeholder not in captured_names:
+            findings.append(f"auth header placeholder {placeholder} must be captured from an earlier response")
 
     if findings:
         return VerificationReport(
@@ -309,6 +336,112 @@ def scan_for_shortcuts(workspace: Path) -> VerificationReport:
     return VerificationReport(success=True, test_summary="static anti-shortcut scan")
 
 
+IMPORT_TO_REQUIREMENT = {
+    "dotenv": "python-dotenv",
+    "fastapi": "fastapi",
+    "httpx": "httpx",
+    "jose": "python-jose",
+    "jwt": "pyjwt",
+    "passlib": "passlib",
+    "pydantic": "pydantic",
+    "pytest": "pytest",
+    "redis": "redis",
+    "sqlalchemy": "sqlalchemy",
+    "uvicorn": "uvicorn",
+}
+
+
+def verify_backend_dependency_manifest(workspace: Path) -> VerificationReport:
+    backend = backend_dir(workspace)
+    requirements_path = backend / "requirements.txt"
+    if not requirements_path.exists():
+        return VerificationReport(
+            success=False,
+            test_summary="backend Python dependencies are declared",
+            reasons_for_failure=(
+                "Missing generated_project/backend/requirements.txt. Generated backend code must "
+                "declare every third-party package it imports so tests and E2E run in a clean environment."
+            ),
+        )
+
+    declared = parse_requirements(requirements_path)
+    imported = discover_backend_third_party_imports(backend)
+    imported.update({"pytest", "uvicorn"})
+    missing = sorted(imported - declared)
+    if missing:
+        return VerificationReport(
+            success=False,
+            test_summary="backend Python dependencies are declared",
+            stdout="\n".join(f"missing requirement: {package}" for package in missing),
+            reasons_for_failure=(
+                "backend/requirements.txt does not include all third-party imports used by backend code or tests."
+            ),
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="backend Python dependencies are declared",
+        stdout=json.dumps({"requirements": sorted(declared), "third_party_imports": sorted(imported)}, indent=2),
+    )
+
+
+def parse_requirements(path: Path) -> set[str]:
+    packages: set[str] = set()
+    for line in path.read_text(errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("-"):
+            continue
+        package = re.split(r"\s*(?:==|>=|<=|~=|!=|>|<|\[)", stripped, maxsplit=1)[0]
+        if package:
+            packages.add(canonical_package_name(package))
+    return packages
+
+
+def discover_backend_third_party_imports(backend: Path) -> set[str]:
+    local_modules = {path.stem for path in backend.glob("*.py")}
+    local_modules.update(path.name for path in backend.iterdir() if path.is_dir())
+    imports: set[str] = set()
+
+    for path in iter_source_files(backend):
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(errors="ignore"))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            module_name: str | None = None
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = alias.name.split(".")[0]
+                    maybe_add_requirement(module_name, local_modules, imports)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    continue
+                if node.module:
+                    module_name = node.module.split(".")[0]
+                    maybe_add_requirement(module_name, local_modules, imports)
+
+    return imports
+
+
+def maybe_add_requirement(module_name: str, local_modules: set[str], imports: set[str]) -> None:
+    if module_name in local_modules:
+        return
+    if module_name in sys.builtin_module_names:
+        return
+    if module_name in getattr(sys, "stdlib_module_names", set()):
+        return
+    if module_name.startswith("_"):
+        return
+    imports.add(canonical_package_name(IMPORT_TO_REQUIREMENT.get(module_name, module_name)))
+
+
+def canonical_package_name(package: str) -> str:
+    return package.strip().lower().replace("_", "-")
+
+
 def verify_generated_tests(workspace: Path) -> VerificationReport:
     backend = backend_dir(workspace)
     test_files = [
@@ -336,7 +469,7 @@ def verify_generated_tests(workspace: Path) -> VerificationReport:
             reasons_for_failure="Missing test coverage for: " + ", ".join(missing),
         )
 
-    result = run_command([sys.executable, "-m", "pytest", "-q"], cwd=backend, timeout=120)
+    result = run_backend_python_command(workspace, ["python", "-m", "pytest", "-q"], timeout=180)
     return VerificationReport(
         success=result.returncode == 0,
         test_summary="pytest execution",
@@ -384,7 +517,16 @@ def verify_contract_e2e(workspace: Path) -> VerificationReport:
 
         if not wait_for_url(f"{backend_base}/docs", timeout=1):
             pid = start_persistent_process(
-                [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(backend_port)],
+                backend_python_command(workspace, [
+                    "python",
+                    "-m",
+                    "uvicorn",
+                    "main:app",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(backend_port),
+                ]),
                 cwd=backend,
                 log_path=workspace / "backend.log",
                 pid_path=workspace / "backend.pid",
@@ -468,6 +610,17 @@ def ensure_frontend_dependencies(frontend: Path) -> VerificationReport:
     )
 
 
+def backend_python_command(workspace: Path, command: list[str]) -> list[str]:
+    requirements = backend_dir(workspace) / "requirements.txt"
+    if requirements.exists():
+        return ["uv", "run", "--isolated", "--with-requirements", "requirements.txt", *command]
+    return command
+
+
+def run_backend_python_command(workspace: Path, command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    return run_command(backend_python_command(workspace, command), cwd=backend_dir(workspace), timeout=timeout)
+
+
 def run_contract_e2e_steps(contract: dict[str, Any], backend_base: str, transcript: list[str]) -> None:
     steps = contract.get("e2e_steps")
     if not isinstance(steps, list) or not steps:
@@ -491,7 +644,9 @@ def run_contract_e2e_steps(contract: dict[str, Any], backend_base: str, transcri
 
         payload = step.get("payload")
         resolved_payload = resolve_placeholders(payload, context) if payload is not None else None
-        status, body = http_request(method, backend_base + path, resolved_payload)
+        headers = step.get("headers")
+        resolved_headers = resolve_placeholders(headers, context) if isinstance(headers, dict) else None
+        status, body = http_request(method, backend_base + path, resolved_payload, headers=resolved_headers)
         transcript.append(
             f"E2E step {index} {name}: {method} {path} "
             f"{json.dumps(resolved_payload) if resolved_payload is not None else ''}-> HTTP {status}\n{body}"
@@ -502,10 +657,19 @@ def run_contract_e2e_steps(contract: dict[str, Any], backend_base: str, transcri
             raise AssertionError(f"E2E step {name} returned HTTP {status}, expected {expected_status}.")
 
         assertions = step.get("assertions", [])
+        parsed_body = None
         if assertions:
             parsed_body = parse_json_body(body, name)
             for assertion in assertions:
                 evaluate_e2e_assertion(assertion, parsed_body, body, context, name)
+        elif body.strip():
+            try:
+                parsed_body = json.loads(body)
+            except json.JSONDecodeError:
+                parsed_body = None
+
+        if parsed_body is not None:
+            capture_e2e_values(step, parsed_body, context, name)
 
 
 def build_placeholder_context(steps: list[Any]) -> dict[str, str]:
@@ -595,6 +759,25 @@ def evaluate_e2e_assertion(
         return
 
     raise AssertionError(f"E2E step {step_name} assertion must use equals, contains, or body_contains.")
+
+
+def capture_e2e_values(step: dict[str, Any], parsed_body: Any, context: dict[str, str], step_name: str) -> None:
+    captures = step.get("captures", {})
+    if captures:
+        if not isinstance(captures, dict):
+            raise AssertionError(f"E2E step {step_name} captures must be an object.")
+        for name, path in captures.items():
+            if not isinstance(name, str) or not isinstance(path, str):
+                raise AssertionError(f"E2E step {step_name} captures must map string names to string paths.")
+            values = json_path_values(parsed_body, path)
+            if not values:
+                raise AssertionError(f"E2E step {step_name} capture path {path} produced no values.")
+            context[name] = str(values[0])
+
+    if isinstance(parsed_body, dict):
+        for name in list(context):
+            if name in parsed_body and isinstance(parsed_body[name], (str, int, float, bool)):
+                context[name] = str(parsed_body[name])
 
 
 def json_path_values(document: Any, path: str) -> list[Any]:
@@ -725,13 +908,18 @@ def frontend_dir(workspace: Path) -> Path:
     return workspace / "frontend"
 
 
-def http_request(method: str, url: str, payload: dict[str, Any] | None = None) -> tuple[int, str]:
+def http_request(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, Any] | None = None,
+) -> tuple[int, str]:
     data = None
-    headers = {}
+    request_headers = {str(key): str(value) for key, value in (headers or {}).items()}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = Request(url, data=data, headers=headers, method=method)
+        request_headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=request_headers, method=method)
     try:
         with urlopen(request, timeout=10) as response:
             return response.status, response.read().decode("utf-8", errors="replace")

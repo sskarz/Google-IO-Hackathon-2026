@@ -71,6 +71,7 @@ Follow these rules:
      Each step MUST include `name`, `method`, `path`, `expected_status`, and optionally `payload` plus `assertions`.
      If the contract includes `negative_cases`, every negative case MUST have an `e2e_steps` entry with `covers_negative_case` set to that exact negative case `case` value.
      Use `{{variable_name}}` placeholders to share random runtime values across steps, e.g. `{{sku}}`, `{{reservation_id}}`, or `/products/{{sku}}`.
+     For authenticated flows, capture response fields for later steps with `captures`, e.g. `{ "access_token": "$.access_token" }`, then use `Authorization: Bearer {{access_token}}` in later `headers`.
      Supported assertion forms are:
        `{ "path": "$.field", "equals": <value> }`
        `{ "path": "$[*].field", "contains": <value> }`
@@ -88,7 +89,8 @@ Follow these rules:
    - E2E_VERIFIER: Starts both services and proves real data flows via curl.
 7. Specify dependencies:
    - BACKEND and FRONTEND tasks can run in parallel.
-   - TESTER and VERIFIER depend on BACKEND.
+   - TESTER depends on BACKEND.
+   - VERIFIER depends on both BACKEND and TESTER. It must never run while tests are still being generated.
    - E2E_VERIFIER depends on BACKEND, FRONTEND, and VERIFIER.
 8. Your output MUST match the DecompositionOutput Pydantic schema exactly.
 """
@@ -107,8 +109,9 @@ Follow these STRICT rules:
 6. Do NOT import from, read from, write to, or reference files outside generated_project. Do not use `../../`, repository-root imports, or absolute paths outside the workspace.
 7. Implement ALL endpoints listed in your task description. If a frontend dashboard or grid is required, you MUST implement a list endpoint (e.g. `GET /profiles`) that returns ALL records — not just single-item lookups.
 8. Add CORS middleware (`from fastapi.middleware.cors import CORSMiddleware`) allowing all origins so the frontend can call you.
-9. Do NOT seed or hardcode any data in the application. The database starts empty; data enters only through API calls.
-10. When complete, return a summary matching the TaskExecutionOutput schema.
+9. Create `backend/requirements.txt`. It MUST list every third-party Python package imported anywhere under `backend/`, including tests. At minimum include `fastapi`, `uvicorn`, and `pytest`; include packages such as `sqlalchemy`, `redis`, `httpx`, `python-jose`, `pyjwt`, or `passlib` if you import them. Do not use undeclared dependencies.
+10. Do NOT seed or hardcode any data in the application. The database starts empty; data enters only through API calls unless the design explicitly requires a seed endpoint or seed script, in which case seeding must happen only through that explicit interface and must be covered by `contract.json`.
+11. When complete, return a summary matching the TaskExecutionOutput schema.
 """
 
 FRONTEND_INSTRUCTIONS = """You are the Frontend UI Developer Agent.
@@ -146,7 +149,8 @@ Follow these STRICT rules:
 6. Use isolated test databases (monkeypatch `DB_PATH`) so tests never share state.
 7. Do NOT hardcode pre-existing data assumptions. Every test creates its own data via the API.
 8. Do NOT skip tests, loosen contract expectations, or fall back to fake clients when a real app path fails.
-9. When complete, return a summary matching the TaskExecutionOutput schema.
+9. If your tests import any third-party packages, ensure `backend/requirements.txt` includes them. If you add `sqlalchemy`, `httpx`, `pytest`, or any other package import to tests, the manifest must be updated in the same task.
+10. When complete, return a summary matching the TaskExecutionOutput schema.
 """
 
 VERIFIER_INSTRUCTIONS = """You are the Test Runner and Verifier Agent.
@@ -154,10 +158,11 @@ Your job is to execute the generated test suite and confirm all data flow tests 
 
 Follow these rules:
 1. Use `run_command` to run pytest from the workspace `backend/` folder. Capture full stdout and stderr.
-2. Read `contract.json` from the workspace root and confirm the backend test suite covers every endpoint in the contract. If it does not, report failure.
-3. The test suite MUST include LIST endpoint tests when the contract includes list endpoints. If it does not, report failure.
-4. If tests fail, analyze the output and explain exactly what broke and how to fix it.
-5. Your output MUST match the TaskVerificationOutput schema. Your success value is advisory only; the dispatcher will run deterministic checks after you finish.
+2. Install and run with `backend/requirements.txt` if it exists, for example `uv run --isolated --with-requirements requirements.txt python -m pytest -q`. Missing dependencies are a real failure, not an environmental excuse.
+3. Read `contract.json` from the workspace root and confirm the backend test suite covers every endpoint in the contract. If it does not, report failure.
+4. The test suite MUST include LIST endpoint tests when the contract includes list endpoints. If it does not, report failure.
+5. If tests fail, analyze the output and explain exactly what broke and how to fix it.
+6. Your output MUST match the TaskVerificationOutput schema. Your success value is advisory only; the dispatcher will run deterministic checks after you finish.
 """
 
 E2E_VERIFIER_INSTRUCTIONS = """You are the End-to-End System Verifier Agent.
@@ -168,7 +173,7 @@ Follow these STRICT rules — do NOT skip any step or simulate any result:
 2. Write `start_servers.sh` in the workspace:
    ```
    #!/bin/bash
-   (cd backend && nohup uv run uvicorn main:app --host 0.0.0.0 --port <BACKEND_PORT> > ../backend.log 2>&1 & echo $! > ../backend.pid)
+   (cd backend && nohup uv run --isolated --with-requirements requirements.txt python -m uvicorn main:app --host 0.0.0.0 --port <BACKEND_PORT> > ../backend.log 2>&1 & echo $! > ../backend.pid)
    (cd frontend && nohup npm run dev -- --host 0.0.0.0 --port <FRONTEND_PORT> > ../frontend.log 2>&1 & echo $! > ../frontend.pid)
    ```
 3. Run: `chmod +x start_servers.sh && bash start_servers.sh`

@@ -1,9 +1,9 @@
 import asyncio
 import os
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, Set
 from google.antigravity import Agent, LocalAgentConfig
 from google.antigravity.hooks import policy
-from db import get_ready_tasks, update_task_status, complete_task, get_all_tasks, kanban_show_tasks, kanban_create_task, add_task, add_dependency, find_available_port as persist_available_port
+from db import get_ready_tasks, update_task_status, complete_task, get_all_tasks, kanban_show_tasks, add_task, add_dependency, find_available_port as persist_available_port
 from deterministic_verifier import verify_generated_project
 from agents import (
     ARCHITECT_INSTRUCTIONS,
@@ -16,6 +16,39 @@ from agents import (
     TaskExecutionOutput,
     TaskVerificationOutput
 )
+
+REQUIRED_TASK_ROLES = {"BACKEND", "FRONTEND", "TESTER", "VERIFIER", "E2E_VERIFIER"}
+
+
+def validate_architect_task_graph(tasks_list: list[dict[str, Any]]) -> list[str]:
+    """Return deterministic architect task/dependency validation findings."""
+    findings: list[str] = []
+    role_to_id = {task.get("assigned_role"): task.get("id") for task in tasks_list}
+    missing_roles = REQUIRED_TASK_ROLES - set(role_to_id)
+    if missing_roles:
+        findings.append(f"Missing required task roles: {sorted(missing_roles)}")
+        return findings
+
+    def deps_for(role: str) -> set[str]:
+        task = next(task for task in tasks_list if task.get("assigned_role") == role)
+        return set(task.get("dependencies") or [])
+
+    required_edges = {
+        "TESTER": {"BACKEND"},
+        "VERIFIER": {"BACKEND", "TESTER"},
+        "E2E_VERIFIER": {"BACKEND", "FRONTEND", "VERIFIER"},
+    }
+    for role, parent_roles in required_edges.items():
+        expected_parent_ids = {role_to_id[parent_role] for parent_role in parent_roles}
+        missing_parent_ids = expected_parent_ids - deps_for(role)
+        if missing_parent_ids:
+            findings.append(
+                f"{role} task must depend on {sorted(parent_roles)} "
+                f"via task IDs {sorted(expected_parent_ids)}"
+            )
+
+    return findings
+
 
 async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
     """Executes a single ready task by spawning the appropriate Antigravity Agent."""
@@ -83,7 +116,7 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
         response_schema=schema,
         workspaces=[abs_workspace],
         policies=policies,
-        tools=[kanban_show_tasks, kanban_create_task, find_available_port]
+        tools=[kanban_show_tasks, find_available_port]
     )
     
     try:
@@ -140,14 +173,11 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
             # If it is the Architect task, register the new tasks on the board
             if role == "ARCHITECT":
                 tasks_list = result_dict.get("tasks", [])
-                required_roles = {"BACKEND", "TESTER", "VERIFIER", "E2E_VERIFIER"}
-                task_roles = {t_info.get("assigned_role") for t_info in tasks_list}
-                missing_roles = required_roles - task_roles
+                graph_findings = validate_architect_task_graph(tasks_list)
                 contract_path = os.path.join(abs_workspace, "contract.json")
-                if missing_roles or not os.path.exists(contract_path):
+                if graph_findings or not os.path.exists(contract_path):
                     error_parts = []
-                    if missing_roles:
-                        error_parts.append(f"Missing required task roles: {sorted(missing_roles)}")
+                    error_parts.extend(graph_findings)
                     if not os.path.exists(contract_path):
                         error_parts.append(f"Missing executable contract: {contract_path}")
                     error_msg = "Architect output failed deterministic gating. " + " ".join(error_parts)

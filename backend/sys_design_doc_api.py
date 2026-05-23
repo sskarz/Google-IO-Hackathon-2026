@@ -15,9 +15,10 @@ from main import run_full_flow
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-PROJECT_ROOT = Path(__file__).parent.parent
+BACKEND_ROOT = Path(__file__).parent
+PROJECT_ROOT = BACKEND_ROOT.parent
 DESIGN_MD = PROJECT_ROOT / "DESIGN.md"
-GENERATED_PROJECT = PROJECT_ROOT / "generated_project"
+GENERATED_PROJECT = BACKEND_ROOT / "generated_project"
 
 app = FastAPI()
 

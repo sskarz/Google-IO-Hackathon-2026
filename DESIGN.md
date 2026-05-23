@@ -1,113 +1,58 @@
-# Overview
-This design document details a simple, full-stack web application that allows users to register, log in, and manage their user profiles. The application is designed to be lightweight, secure, and easy to run locally.
+# Online Library Store System Design
+
+Build a full-stack online library store where customers can create accounts, log in, browse books, add books to an order, check out, and review their order history.
 
 ## Goals
-* **User Authentication**: Secure user registration, login, and session management.
-* **Profile Management**: Capabilities to create, view, and update dynamic user profile details (e.g., full name, bio, and avatar).
-* **Simplified Tech Stack**: A unified, low-overhead setup combining a Python backend with zero external build-tooling requirements for the frontend.
-* **Persistent Storage**: Utilization of a relational database schemas with robust password hashing.
 
-## Architecture
-The application uses a unified monolithic single-server architecture. The FastAPI backend serves both the transactional JSON APIs and the static frontend SPA (Single Page Application).
+- Let users register and log in with an email and password.
+- Let authenticated users browse a book catalog and search by title, author, or genre.
+- Let users add available books to a cart and complete checkout.
+- Persist users, books, carts, and orders in a SQL database.
+- Use Redis caching to reduce repeated database reads for the public book catalog.
+- Provide a React frontend with a book-themed browsing and checkout experience.
 
-```mermaid
-graph TD
-    Client["Browser client (HTML/JS)"] <-->|HTTP API / JWT| Backend["FastAPI Server"]
-    Backend <-->|SQLAlchemy ORM| DB[("SQLite Database<br>(backend.db)")]
-```
+## Backend
 
-* **Frontend**: A clean, single-page application built on HTML5, Tailwind CSS (loaded via CDN), and vanilla JavaScript. Kept in a `/static` dir web-served directly by FastAPI.
-* **Backend**: FastAPI RESTful backend running with Uvicorn, structured to handle authorization routes, profile CRUD operations, and serve static assets.
-* **Database**: SQLite (SQLModel/SQLAlchemy) for zero-setup, lightweight data persistence.
+Use Python for the backend API and a SQL database for persistence. Store password hashes, not raw passwords.
 
-## Components
-### 1. Frontend Client
-Composed of index files served statically:
-* **Authentication Screens**: Minimal signup and login forms with real-time field validation.
-* **User Dashboard & Profile Card**: A secure view featuring user-specific metadata and an editable profile configuration panel.
-* **API Bridge (`app.js`)**: Coordinates fetches to the FastAPI backend, controls state, and stores authorization tokens in `localStorage`.
+Core data:
 
-### 2. Backend Service ([main.py](file:///Users/epicgdog/Documents/projects/Google-IO-Hackathon-2026/backend/main.py))
-* **Application Initializer**: Registers endpoints and mounts static files.
-* **Authentication Router (`/api/auth`)**:
-  * `POST /api/auth/register`: Create a username/password record. Passwords are securely hashed with `bcrypt`/`passlib`.
-  * `POST /api/auth/token`: Performs authentication checks and returns a JWT access token.
-* **Profiles Router (`/api/profiles`)**:
-  * `GET /api/profiles/me`: Returns the active user's profile information.
-  * `PUT /api/profiles/me`: Updates profile details.
-* **Static SPA router (`/`)**: Fallback router to serve client index pages for unrecognized endpoints.
+- User: id, email, password_hash, display_name, created_at.
+- Book: id, title, author, genre, description, price_cents, inventory_count, cover_theme, created_at.
+- Cart item: user_id, book_id, quantity.
+- Order: id, user_id, status, total_cents, created_at.
+- Order item: order_id, book_id, title_snapshot, price_cents, quantity.
 
-### 3. Database Layer
-Managed with SQLAlchemy or SQLModel schemas:
-* **Users Schema**:
-  * `id`: Integer (Primary Key)
-  * `username`: String (Unique, Indexed)
-  * `hashed_password`: String
-  * `created_at`: DateTime
-* **Profiles Schema**:
-  * `id`: Integer (Primary Key)
-  * `user_id`: Integer (Foreign Key -> Users.id)
-  * `full_name`: String (Nullable)
-  * `bio`: String (Nullable)
-  * `avatar_url`: String (Nullable)
-  * `updated_at`: DateTime
+Required behavior:
 
-## Data Flow
-### User Registration & Authentication Flow
-```mermaid
-sequenceDiagram
-    participant Browser as Frontend App
-    participant Auth as Auth Endpoints
-    participant DB as SQLite Database
+- Registering with a duplicate email should fail.
+- Login should return an auth token that can be used for protected requests.
+- Catalog browsing should work for unauthenticated visitors.
+- Book catalog reads should be cached in Redis and invalidated when book inventory changes.
+- Cart and checkout endpoints require authentication.
+- Checkout must fail if a requested book is out of stock or requested quantity exceeds inventory.
+- Successful checkout creates an order, creates order items, decrements book inventory, clears the cart, and returns the order summary.
+- Order history should only show the authenticated user's orders.
 
-    Browser->>Auth: POST /api/auth/register (username, password)
-    Auth->>DB: Check if username exists
-    alt Username exists
-        Auth-->>Browser: 400 Bad Request
-    else Username is available
-        Auth->>Auth: Hash password with bcrypt
-        Auth->>DB: Save User & Profile records
-        DB-->>Auth: Saved
-        Auth-->>Browser: 201 Created
-    end
+## Frontend
 
-    Browser->>Auth: POST /api/auth/token (username, password)
-    Auth->>DB: Read user hash
-    Auth->>Auth: Verify password match
-    alt Verification fails
-        Auth-->>Browser: 401 Unauthorized
-    else Verification succeeds
-        Auth->>Auth: Generate JWT with expiry
-        Auth-->>Browser: 200 OK (access_token)
-    end
-```
+Use React for the frontend. The UI should feel like an online bookstore or library, with a catalog-first layout.
 
-### Profile Retrieval & Update Flow
-```mermaid
-sequenceDiagram
-    participant Browser as Frontend App
-    participant ProfileAPI as Profile Endpoints
-    participant DB as SQLite Database
+Pages and features:
 
-    Browser->>ProfileAPI: GET /api/profiles/me (Authorization: Bearer <token>)
-    ProfileAPI->>ProfileAPI: Decode and validate JWT
-    alt Invalid/Expired Token
-        ProfileAPI-->>Browser: 401 Unauthorized
-    else Valid Token
-        ProfileAPI->>DB: Retrieve profile record using user_id
-        DB-->>ProfileAPI: Profile Data
-        ProfileAPI-->>Browser: 200 OK (Profile payload)
-    end
+- Account registration and login screens.
+- A catalog page with search and genre filtering.
+- Book cards showing title, author, price, inventory availability, and a themed cover area.
+- A cart view that lets the user update quantities or remove books.
+- A checkout action that creates an order and shows a confirmation.
+- An order history page showing past orders and item details.
+- Clear loading, empty, and error states.
 
-    Browser->>ProfileAPI: PUT /api/profiles/me (Authorization: Bearer <token>, Profile Payload)
-    ProfileAPI->>ProfileAPI: Validate JWT & payload parameters
-    ProfileAPI->>DB: Update profile column values
-    DB-->>ProfileAPI: Saved
-    ProfileAPI-->>Browser: 200 OK (Updated profile payload)
-```
+The frontend should use real API calls to the backend and should not render fake fallback books, users, carts, or orders.
 
-## Open Questions
-1. **JWT Storage**: Should the frontend store access tokens in `localStorage` for visual code simplicity, or on HttpOnly, secure cookies to guard against Cross-Site Scripting (XSS) attacks?
-2. **Profile Avatars**: Will simple string-based URLs (or high-quality default emoji selections) satisfy the profile picture goal, or is custom image file-uploading required?
-3. **ORM Selection**: Do you prefer traditional `SQLAlchemy` schemas paired with native `Pydantic` models, or unified `SQLModel` libraries for rapid prototyping?
-4. **Environment Configuration**: Should we configure database path and security keys using a `.env` loader file, or default to standard in-memory parameters for starting?
+## Reliability And Validation
+
+- Database state should start empty except for any explicit seed endpoint or local seed script the generated project documents and tests.
+- API validation should return clear JSON errors for duplicate accounts, invalid login, unauthorized cart access, invalid quantities, and insufficient inventory.
+- Automated tests should prove registration, login, catalog browsing, cart updates, checkout inventory changes, and order history access.
+- End-to-end verification should run the backend and frontend, create a user, add books, check out, and confirm the resulting order and inventory state through real API calls.

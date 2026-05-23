@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 import shutil
+import time
 import dotenv
 
 # Load environment variables from the current directory and the parent directory
@@ -64,7 +65,14 @@ def reset_flow_state(workspace_path: str) -> None:
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     if os.path.exists(workspace_path):
-        shutil.rmtree(workspace_path)
+        for attempt in range(3):
+            try:
+                shutil.rmtree(workspace_path)
+                break
+            except OSError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.2)
 
 def initialize_flow(design_content: str, workspace_path: str, reset: bool = False) -> None:
     """Initializes the Kanban board and seeds the architect task."""

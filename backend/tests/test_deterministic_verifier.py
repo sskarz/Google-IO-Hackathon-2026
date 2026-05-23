@@ -1,11 +1,13 @@
 import json
 import textwrap
 
+import deterministic_verifier as dv
 from db import find_available_port
 from deterministic_verifier import (
     evaluate_e2e_assertion,
     scan_for_shortcuts,
     verify_e2e_steps_declared,
+    verify_backend_dependency_manifest,
     verify_generated_project,
     verify_no_external_file_references,
     verify_workspace_layout,
@@ -76,6 +78,7 @@ def write_contract_covered_test(workspace):
     backend = workspace / "backend"
     backend.mkdir(exist_ok=True)
     (backend / "main.py").write_text("app = None\n")
+    (backend / "requirements.txt").write_text("pytest\nuvicorn\n")
     (backend / "test_generated_contract.py").write_text(
         textwrap.dedent(
             """
@@ -129,6 +132,29 @@ def test_deterministic_verifier_fails_without_contract(tmp_path):
 
     assert not report.success
     assert "contract.json" in report.reasons_for_failure
+
+
+def test_backend_dependency_manifest_is_required(tmp_path):
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    (backend / "main.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n")
+
+    report = verify_backend_dependency_manifest(tmp_path)
+
+    assert not report.success
+    assert "requirements.txt" in report.reasons_for_failure
+
+
+def test_backend_dependency_manifest_must_cover_imports(tmp_path):
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    (backend / "main.py").write_text("from fastapi import FastAPI\nfrom sqlalchemy import create_engine\n")
+    (backend / "requirements.txt").write_text("fastapi\npytest\nuvicorn\n")
+
+    report = verify_backend_dependency_manifest(tmp_path)
+
+    assert not report.success
+    assert "missing requirement: sqlalchemy" in report.stdout
 
 
 def test_static_scan_catches_seed_data_and_relative_db_path(tmp_path):
@@ -257,6 +283,26 @@ def test_e2e_contract_gate_requires_negative_case_steps(tmp_path):
     assert report.success, report.model_dump()
 
 
+def test_e2e_contract_gate_rejects_unsupported_assertion_paths(tmp_path):
+    write_valid_contract(tmp_path)
+    contract = json.loads((tmp_path / "contract.json").read_text())
+    contract["e2e_steps"].append(
+        {
+            "name": "unsupported filter path",
+            "method": "GET",
+            "path": "/profiles",
+            "expected_status": 200,
+            "assertions": [{"path": "$[?(@.id==1)].email", "equals": "sample@example.com"}],
+        }
+    )
+    (tmp_path / "contract.json").write_text(json.dumps(contract))
+
+    report = verify_e2e_steps_declared(tmp_path)
+
+    assert not report.success
+    assert "unsupported path" in report.stdout
+
+
 def test_e2e_assertions_support_exact_and_list_contains():
     context = {"sku": "SKU-123"}
 
@@ -274,3 +320,42 @@ def test_e2e_assertions_support_exact_and_list_contains():
         context,
         "list check",
     )
+
+
+def test_contract_e2e_steps_capture_tokens_and_send_headers(monkeypatch):
+    calls = []
+
+    def fake_http_request(method, url, payload=None, headers=None):
+        calls.append({"method": method, "url": url, "payload": payload, "headers": headers or {}})
+        if url.endswith("/login"):
+            return 200, json.dumps({"access_token": "real-token", "token_type": "bearer"})
+        if url.endswith("/cart"):
+            assert headers["Authorization"] == "Bearer real-token"
+            return 200, json.dumps({"status": "added"})
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(dv, "http_request", fake_http_request)
+    contract = {
+        "e2e_steps": [
+            {
+                "name": "login",
+                "method": "POST",
+                "path": "/login",
+                "payload": {"email": "{{email}}", "password": "secret"},
+                "expected_status": 200,
+                "captures": {"access_token": "$.access_token"},
+            },
+            {
+                "name": "authenticated cart",
+                "method": "POST",
+                "path": "/cart",
+                "headers": {"Authorization": "Bearer {{access_token}}"},
+                "payload": {"book_id": 1, "quantity": 1},
+                "expected_status": 200,
+            },
+        ]
+    }
+
+    dv.run_contract_e2e_steps(contract, "http://backend", [])
+
+    assert calls[1]["headers"]["Authorization"] == "Bearer real-token"

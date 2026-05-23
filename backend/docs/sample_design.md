@@ -1,127 +1,58 @@
-# Inventory Reservation System Design
+# Online Library Store System Design
 
-Build a small full-stack inventory reservation system.
+Build a full-stack online library store where customers can create accounts, log in, browse books, add books to an order, check out, and review their order history.
+
+## Goals
+
+- Let users register and log in with an email and password.
+- Let authenticated users browse a book catalog and search by title, author, or genre.
+- Let users add available books to a cart and complete checkout.
+- Persist users, books, carts, and orders in a SQL database.
+- Use Redis caching to reduce repeated database reads for the public book catalog.
+- Provide a React frontend with a book-themed browsing and checkout experience.
 
 ## Backend
 
-Use FastAPI with SQLite storage. The SQLite database file must be resolved relative to the generated backend source file, not the process working directory. Enable CORS for the local frontend.
+Use Python for the backend API and a SQL database for persistence. Store password hashes, not raw passwords.
 
-### Domain Rules
+Core data:
 
-The system tracks products and temporary reservations.
+- User: id, email, password_hash, display_name, created_at.
+- Book: id, title, author, genre, description, price_cents, inventory_count, cover_theme, created_at.
+- Cart item: user_id, book_id, quantity.
+- Order: id, user_id, status, total_cents, created_at.
+- Order item: order_id, book_id, title_snapshot, price_cents, quantity.
 
-- A product has `sku`, `name`, `total_stock`, `available_stock`, and `created_at`.
-- A reservation has `reservation_id`, `sku`, `quantity`, `status`, and `created_at`.
-- `sku` and `reservation_id` are unique non-empty strings.
-- `total_stock` must be a positive integer. `available_stock` starts equal to `total_stock`.
-- A reservation can only be created when requested `quantity <= available_stock`.
-- Creating a reservation immediately reduces `available_stock`.
-- Releasing an active reservation changes its status to `released` and restores stock.
-- Committing an active reservation changes its status to `committed` and does not restore stock.
-- Released or committed reservations cannot be released or committed again.
-- The database starts empty. Do not seed or hardcode products or reservations.
+Required behavior:
 
-## API Endpoints
-
-All endpoints return JSON.
-
-1. `POST /products`
-   - Creates a product from `sku`, `name`, and `total_stock`.
-   - Returns `201 Created` with the full product including `available_stock` and `created_at`.
-   - Returns `400 Bad Request` for missing fields, duplicate `sku`, or non-positive stock.
-
-2. `GET /products/{sku}`
-   - Returns `200 OK` with the matching product.
-   - Returns `404 Not Found` when the product does not exist.
-
-3. `GET /products`
-   - Returns `200 OK` with all products sorted by `created_at` ascending.
-
-4. `POST /reservations`
-   - Creates an active reservation from `reservation_id`, `sku`, and `quantity`.
-   - Returns `201 Created` with the reservation and the product's updated `available_stock`.
-   - Returns `400 Bad Request` when quantity is invalid, stock is insufficient, or `reservation_id` is duplicate.
-   - Returns `404 Not Found` when the product does not exist.
-
-5. `POST /reservations/{reservation_id}/release`
-   - Releases an active reservation and restores the reserved quantity to the product.
-   - Returns `200 OK` with the updated reservation and updated product stock.
-   - Returns `400 Bad Request` when the reservation is not active and `404 Not Found` when missing.
-
-6. `POST /reservations/{reservation_id}/commit`
-   - Commits an active reservation without restoring stock.
-   - Returns `200 OK` with the updated reservation and product stock.
-   - Returns `400 Bad Request` when the reservation is not active and `404 Not Found` when missing.
-
-7. `GET /reservations`
-   - Returns `200 OK` with all reservations sorted by `created_at` ascending.
+- Registering with a duplicate email should fail.
+- Login should return an auth token that can be used for protected requests.
+- Catalog browsing should work for unauthenticated visitors.
+- Book catalog reads should be cached in Redis and invalidated when book inventory changes.
+- Cart and checkout endpoints require authentication.
+- Checkout must fail if a requested book is out of stock or requested quantity exceeds inventory.
+- Successful checkout creates an order, creates order items, decrements book inventory, clears the cart, and returns the order summary.
+- Order history should only show the authenticated user's orders.
 
 ## Frontend
 
-Build a React/Vite dashboard that reads the backend port from `config.json` and uses real `fetch()` calls only. It must never render fake fallback products or reservations.
+Use React for the frontend. The UI should feel like an online bookstore or library, with a catalog-first layout.
 
-The UI must include:
+Pages and features:
 
-- A product creation form for `sku`, `name`, and `total_stock`.
-- A product inventory table loaded from `GET /products`.
-- A reservation form for `reservation_id`, `sku`, and `quantity`.
-- A reservation table loaded from `GET /reservations`.
-- Release and commit controls for active reservations that call the matching backend endpoints.
-- Visible empty states when no products or reservations exist.
-- Clear error messaging for validation failures, insufficient stock, missing products, and backend offline states.
+- Account registration and login screens.
+- A catalog page with search and genre filtering.
+- Book cards showing title, author, price, inventory availability, and a themed cover area.
+- A cart view that lets the user update quantities or remove books.
+- A checkout action that creates an order and shows a confirmation.
+- An order history page showing past orders and item details.
+- Clear loading, empty, and error states.
 
-## Required Contract
+The frontend should use real API calls to the backend and should not render fake fallback books, users, carts, or orders.
 
-The architect must write `generated_project/contract.json` with every endpoint above. It must include executable valid payloads for at least:
+## Reliability And Validation
 
-- Creating a product with stock `10`.
-- Reading that product by `sku`.
-- Listing products.
-- Creating a reservation for quantity `4`.
-- Listing reservations.
-- Releasing one active reservation.
-- Committing a second active reservation.
-
-The contract must also describe negative cases for insufficient stock, duplicate product SKU, duplicate reservation ID, non-positive stock, non-positive quantity, missing product, and repeated release or commit of a non-active reservation.
-
-The contract must include an ordered `e2e_steps` array that deterministic verification can run without interpreting prose. These steps must use runtime placeholders like `{{sku}}`, `{{release_reservation_id}}`, and `{{commit_reservation_id}}`, and must cover:
-
-1. Create a product with stock `10`; assert `available_stock == 10`.
-2. Read that product by SKU; assert `available_stock == 10`.
-3. Reserve quantity `4` with `release_reservation_id`; assert reservation `status == active` and response `available_stock == 6`.
-4. Attempt to reserve quantity `7` with a different reservation ID; assert HTTP `400`.
-5. Release `release_reservation_id`; assert reservation `status == released`.
-6. Read the product again; assert `available_stock == 10`.
-7. Reserve quantity `4` with `commit_reservation_id`; assert `available_stock == 6`.
-8. Commit `commit_reservation_id`; assert reservation `status == committed`.
-9. Read the product again; assert `available_stock == 6`.
-10. List reservations; assert the list contains both reservation IDs.
-11. Attempt duplicate product SKU; assert HTTP `400` and set `covers_negative_case` to `duplicate_product_sku`.
-12. Attempt duplicate reservation ID; assert HTTP `400` and set `covers_negative_case` to `duplicate_reservation_id`.
-13. Attempt non-positive stock; assert HTTP `400` and set `covers_negative_case` to `non_positive_stock`.
-14. Attempt non-positive quantity; assert HTTP `400` and set `covers_negative_case` to `non_positive_quantity`.
-15. Attempt reservation for a missing product; assert HTTP `404` and set `covers_negative_case` to `missing_product`.
-16. Attempt repeated release or commit against a non-active reservation; assert HTTP `400` and set `covers_negative_case` to `repeated_release_or_commit`.
-
-Every object in `negative_cases` must have a matching `e2e_steps` object whose `covers_negative_case` value exactly matches the negative case `case` value.
-
-Use assertion objects in this format:
-
-- `{ "path": "$.available_stock", "equals": 6 }`
-- `{ "path": "$.status", "equals": "released" }`
-- `{ "path": "$[*].reservation_id", "contains": "{{commit_reservation_id}}" }`
-
-## Required Verification
-
-Generated backend tests must create random SKUs and reservation IDs through the API, then prove:
-
-- Creating a product returns `available_stock == total_stock`.
-- Reserving quantity `4` from stock `10` returns `available_stock == 6`.
-- Attempting to reserve quantity `7` while only `6` are available fails with `400`.
-- Releasing the active reservation restores `available_stock == 10`.
-- Committing a separate reservation for quantity `4` leaves `available_stock == 6`.
-- Product detail and product list responses reflect the same persisted stock values.
-- Reservation list responses include every reservation created during the test with the correct statuses.
-- Duplicate IDs, invalid quantities, missing products, and repeated terminal-state transitions fail with expected status codes.
-
-E2E verification must start the real backend and frontend, run the product and reservation lifecycle against the backend API, confirm persisted state through list/detail reads, confirm the frontend serves successfully, and fail if any generated code uses seeded data or hardcoded frontend records.
+- Database state should start empty except for any explicit seed endpoint or local seed script the generated project documents and tests.
+- API validation should return clear JSON errors for duplicate accounts, invalid login, unauthorized cart access, invalid quantities, and insufficient inventory.
+- Automated tests should prove registration, login, catalog browsing, cart updates, checkout inventory changes, and order history access.
+- End-to-end verification should run the backend and frontend, create a user, add books, check out, and confirm the resulting order and inventory state through real API calls.
