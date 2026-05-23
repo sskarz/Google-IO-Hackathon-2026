@@ -205,12 +205,13 @@ def kanban_create_task(
     except Exception as e:
         return f"Failed to create task: {str(e)}"
 
-def find_available_port(role: str, start_port: int = 8000) -> int:
-    """Finds an available TCP port starting from start_port, and saves it in config.json.
+def find_available_port(role: str, start_port: int = 8000, workspace_path: Optional[str] = None) -> int:
+    """Finds an available TCP port and saves it in the generated workspace config.
     
     Args:
         role: The service role ('BACKEND' or 'FRONTEND').
         start_port: The port number to start scanning from.
+        workspace_path: The generated_project directory where config.json belongs.
     """
     port = start_port
     while True:
@@ -220,20 +221,23 @@ def find_available_port(role: str, start_port: int = 8000) -> int:
                 break
         port += 1
     
+    config_dir = os.path.abspath(workspace_path or os.getcwd())
+    os.makedirs(config_dir, exist_ok=True)
+    config_path = os.path.join(config_dir, "config.json")
+
     # Read existing config
     config = {}
-    if os.path.exists("config.json"):
+    if os.path.exists(config_path):
         try:
-            with open("config.json", "r") as f:
+            with open(config_path, "r") as f:
                 config = json.load(f)
         except Exception:
             pass
             
     config[role.lower() + "_port"] = port
     
-    with open("config.json", "w") as f:
+    with open(config_path, "w") as f:
         json.dump(config, f, indent=4)
         
-    print(f"Allocated {role} port: {port}")
+    print(f"Allocated {role} port: {port} in {config_path}")
     return port
-

@@ -3,7 +3,8 @@ import os
 from typing import Dict, Any, List, Set
 from google.antigravity import Agent, LocalAgentConfig
 from google.antigravity.hooks import policy
-from db import get_ready_tasks, update_task_status, complete_task, get_all_tasks, kanban_show_tasks, kanban_create_task, add_task, add_dependency, find_available_port
+from db import get_ready_tasks, update_task_status, complete_task, get_all_tasks, kanban_show_tasks, kanban_create_task, add_task, add_dependency, find_available_port as persist_available_port
+from deterministic_verifier import verify_generated_project
 from agents import (
     ARCHITECT_INSTRUCTIONS,
     BACKEND_INSTRUCTIONS,
@@ -73,6 +74,10 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
         raise ValueError(f"Unknown assigned role: {role}")
     
     # Configure Agent
+    def find_available_port(role: str, start_port: int = 8000) -> int:
+        """Find an available port and save it to this generated_project/config.json."""
+        return persist_available_port(role=role, start_port=start_port, workspace_path=abs_workspace)
+
     config = LocalAgentConfig(
         system_instructions=instructions,
         response_schema=schema,
@@ -104,12 +109,25 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
             else:
                 result_dict = dict(result)
                 
-            # For verification task, check if it passed
+            # For verification tasks, the agent report is advisory. The
+            # dispatcher must independently verify the generated workspace.
             if role in ("VERIFIER", "E2E_VERIFIER"):
-                success = result_dict.get("success", False)
-                if not success:
+                agent_success = result_dict.get("success", False)
+                deterministic_report = verify_generated_project(abs_workspace, role)
+                result_dict = {
+                    **deterministic_report.model_dump(),
+                    "agent_report": result_dict,
+                }
+                if not agent_success:
+                    result_dict["success"] = False
+                    result_dict["reasons_for_failure"] = (
+                        f"Verifier agent reported failure.\n"
+                        f"{result_dict.get('reasons_for_failure') or ''}"
+                    ).strip()
+
+                if not result_dict["success"]:
                     error_msg = (
-                        f"Tests failed.\n"
+                        f"Deterministic verification failed.\n"
                         f"Summary: {result_dict.get('test_summary')}\n"
                         f"Stdout: {result_dict.get('stdout')}\n"
                         f"Stderr: {result_dict.get('stderr')}\n"
@@ -122,6 +140,21 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
             # If it is the Architect task, register the new tasks on the board
             if role == "ARCHITECT":
                 tasks_list = result_dict.get("tasks", [])
+                required_roles = {"BACKEND", "TESTER", "VERIFIER", "E2E_VERIFIER"}
+                task_roles = {t_info.get("assigned_role") for t_info in tasks_list}
+                missing_roles = required_roles - task_roles
+                contract_path = os.path.join(abs_workspace, "contract.json")
+                if missing_roles or not os.path.exists(contract_path):
+                    error_parts = []
+                    if missing_roles:
+                        error_parts.append(f"Missing required task roles: {sorted(missing_roles)}")
+                    if not os.path.exists(contract_path):
+                        error_parts.append(f"Missing executable contract: {contract_path}")
+                    error_msg = "Architect output failed deterministic gating. " + " ".join(error_parts)
+                    print(f"xxx [FAILED] {error_msg}")
+                    update_task_status(task_id, "BLOCKED", error_msg=error_msg)
+                    return
+
                 for t_info in tasks_list:
                     # Register new task
                     add_task(
@@ -130,7 +163,10 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
                         description=t_info["description"],
                         assigned_role=t_info["assigned_role"],
                         status="TODO",
-                        input_data={"design_reference": task['description']}
+                        input_data={
+                            "design_reference": task.get("input_data"),
+                            "contract_path": os.path.join(abs_workspace, "contract.json"),
+                        }
                     )
                     # Add parent dependencies
                     for parent_id in t_info.get("dependencies", []):
