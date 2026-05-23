@@ -65,3 +65,13 @@ dmypy.json
 .env
 .env.local
 db.sqlite3
+
+# Generated project files and local database
+generated_project/
+kanban.db
+
+# GCP Credentials and Archives
+gcp-credentials.json
+*.tar.gz
+
+

@@ -3,10 +3,12 @@ import base64
 import json
 import logging
 import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal
 import traceback
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Literal
+from google.antigravity import Agent, LocalAgentConfig
 
 logging.basicConfig(level=logging.INFO)
 
@@ -17,10 +19,15 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
 
+from db import get_all_tasks
+from main import run_full_flow
+
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-PROJECT_ROOT = Path(__file__).parent.parent
+BACKEND_ROOT = Path(__file__).parent
+PROJECT_ROOT = BACKEND_ROOT.parent
 DESIGN_MD = PROJECT_ROOT / "DESIGN.md"
+GENERATED_PROJECT = BACKEND_ROOT / "generated_project"
 SPEC_MODEL = os.getenv("GEMINI_SPEC_MODEL", "gemini-2.5-pro")
 AUDITOR_MODEL = "gemini-3.5-flash"
 TTS_MODEL = "gemini-2.5-flash-preview-tts"
@@ -251,6 +258,28 @@ class AuditorTurnResponse(BaseModel):
     section_content: str | None = None
     all_done: bool = False
     full_design: str | None = None
+
+
+class StartFlowRequest(BaseModel):
+    reset: bool = True
+    design_markdown: str | None = None
+
+
+flow_state: dict[str, Any] = {
+    "run_id": None,
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+flow_task: asyncio.Task | None = None
+
+
+async def generate_markdown(transcript: str) -> str:
+    config = LocalAgentConfig(system_instructions=SYSTEM_PROMPT)
+    async with Agent(config) as agent:
+        response = await agent.chat(transcript)
+        return await response.text()
 
 
 @dataclass
@@ -491,6 +520,99 @@ async def generate_spec():
             )
 
     return spec.model_dump(by_alias=True, exclude_none=True)
+
+
+def read_current_design() -> str:
+    if not DESIGN_MD.exists():
+        return ""
+    return DESIGN_MD.read_text(encoding="utf-8")
+
+
+def task_snapshot() -> list[dict[str, Any]]:
+    try:
+        return get_all_tasks()
+    except Exception:
+        return []
+
+
+def derive_flow_status(tasks: list[dict[str, Any]]) -> str:
+    if not tasks:
+        return flow_state["status"]
+    if any(t["status"] == "BLOCKED" for t in tasks):
+        return "blocked"
+    if all(t["status"] == "DONE" for t in tasks):
+        return "completed"
+    if any(t["status"] == "IN_PROGRESS" for t in tasks):
+        return "running"
+    return "queued"
+
+
+async def run_flow_background(run_id: str, design_markdown: str, reset: bool) -> None:
+    flow_state.update(
+        {
+            "run_id": run_id,
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "error": None,
+        }
+    )
+    try:
+        await run_full_flow(
+            design_content=design_markdown,
+            workspace_path=str(GENERATED_PROJECT),
+            reset=reset,
+        )
+        flow_state["status"] = derive_flow_status(task_snapshot())
+    except Exception as e:
+        flow_state["status"] = "failed"
+        flow_state["error"] = str(e)
+    finally:
+        flow_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/start-flow")
+async def start_flow(body: StartFlowRequest):
+    global flow_task
+
+    if flow_task is not None and not flow_task.done():
+        raise HTTPException(status_code=409, detail="A generation flow is already running.")
+
+    design_markdown = (body.design_markdown or read_current_design()).strip()
+    if not design_markdown:
+        raise HTTPException(status_code=400, detail="No system design is available to run.")
+
+    run_id = datetime.now(timezone.utc).strftime("flow_%Y%m%d%H%M%S")
+    flow_task = asyncio.create_task(
+        run_flow_background(
+            run_id=run_id,
+            design_markdown=design_markdown,
+            reset=body.reset,
+        )
+    )
+
+    return {
+        "success": True,
+        "run_id": run_id,
+        "status": "running",
+        "workspace": str(GENERATED_PROJECT),
+        "status_url": "/flow-status",
+    }
+
+
+@app.get("/flow-status")
+async def get_flow_status():
+    tasks = task_snapshot()
+    status = derive_flow_status(tasks)
+    if flow_task is not None and not flow_task.done():
+        status = "running"
+
+    return {
+        **flow_state,
+        "status": status,
+        "workspace": str(GENERATED_PROJECT),
+        "tasks": tasks,
+    }
 
 
 # ── Gemini Live API ────────────────────────────────────────────────────────────

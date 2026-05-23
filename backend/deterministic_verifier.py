@@ -1,0 +1,984 @@
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+import ast
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+
+EXCLUDED_DIRS = {
+    ".git",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+}
+
+
+@dataclass
+class VerificationReport:
+    success: bool
+    test_summary: str
+    stdout: str = ""
+    stderr: str = ""
+    reasons_for_failure: str | None = None
+
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "test_summary": self.test_summary,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "reasons_for_failure": self.reasons_for_failure,
+        }
+
+
+def verify_generated_project(workspace_path: str, role: str) -> VerificationReport:
+    """Run non-agentic verification gates for generated workspaces."""
+    workspace = Path(workspace_path).resolve()
+    checks: list[VerificationReport] = [
+        verify_workspace_layout(workspace),
+        verify_no_external_file_references(workspace),
+        verify_contract_exists(workspace),
+        verify_e2e_steps_declared(workspace),
+        scan_for_shortcuts(workspace),
+        verify_backend_dependency_manifest(workspace),
+        verify_generated_tests(workspace),
+    ]
+
+    if role == "E2E_VERIFIER":
+        checks.extend(
+            [
+                verify_frontend_build(workspace),
+                verify_contract_e2e(workspace),
+            ]
+        )
+
+    failures = [check for check in checks if not check.success]
+    stdout = "\n\n".join(
+        f"## {check.test_summary}\n{check.stdout}".strip() for check in checks if check.stdout
+    )
+    stderr = "\n\n".join(check.stderr for check in checks if check.stderr)
+
+    if failures:
+        reasons = "\n".join(
+            f"- {failure.test_summary}: {failure.reasons_for_failure or failure.stderr}"
+            for failure in failures
+        )
+        return VerificationReport(
+            success=False,
+            test_summary=f"{len(failures)} deterministic verification gate(s) failed",
+            stdout=stdout,
+            stderr=stderr,
+            reasons_for_failure=reasons,
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary=f"All {len(checks)} deterministic verification gates passed",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def verify_no_external_file_references(workspace: Path) -> VerificationReport:
+    findings: list[str] = []
+    workspace_text = str(workspace)
+
+    for path in iter_generated_text_files(workspace):
+        rel = path.relative_to(workspace)
+        text = path.read_text(errors="ignore")
+
+        if "../.." in text or "..\\.." in text:
+            findings.append(f"{rel}: contains a parent-directory escape beyond generated_project")
+
+        for match in re.finditer(r"(?P<path>/Users/[^\s\"'`),;]+)", text):
+            referenced_path = match.group("path")
+            if not referenced_path.startswith(workspace_text):
+                findings.append(f"{rel}: references absolute path outside generated_project: {referenced_path}")
+
+    if findings:
+        return VerificationReport(
+            success=False,
+            test_summary="generated project does not reference files outside generated_project",
+            stdout="\n".join(findings),
+            reasons_for_failure="Generated project code must not depend on files outside generated_project.",
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="generated project does not reference files outside generated_project",
+    )
+
+
+def verify_workspace_layout(workspace: Path) -> VerificationReport:
+    backend_dir = workspace / "backend"
+    frontend_dir = workspace / "frontend"
+    findings: list[str] = []
+
+    if not backend_dir.is_dir():
+        findings.append("missing generated_project/backend directory")
+    if not frontend_dir.is_dir():
+        findings.append("missing generated_project/frontend directory")
+    if (workspace / "main.py").exists():
+        findings.append("backend FastAPI files must not be written at generated_project/main.py")
+    if (workspace / "package.json").exists():
+        findings.append("frontend package.json must not be written at generated_project/package.json")
+    if backend_dir.is_dir() and not (backend_dir / "main.py").exists():
+        findings.append("generated_project/backend/main.py is required for uvicorn main:app")
+    if frontend_dir.is_dir() and not (frontend_dir / "package.json").exists():
+        findings.append("generated_project/frontend/package.json is required for the Vite app")
+
+    if findings:
+        return VerificationReport(
+            success=False,
+            test_summary="generated workspace uses dedicated backend/frontend folders",
+            stdout="\n".join(findings),
+            reasons_for_failure="Generated code must be split into generated_project/backend and generated_project/frontend.",
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="generated workspace uses dedicated backend/frontend folders",
+    )
+
+
+def verify_contract_exists(workspace: Path) -> VerificationReport:
+    contract_path = workspace / "contract.json"
+    if not contract_path.exists():
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json exists",
+            reasons_for_failure="Missing generated_project/contract.json. The design must be converted into an executable contract before verification.",
+        )
+
+    try:
+        contract = json.loads(contract_path.read_text())
+    except json.JSONDecodeError as exc:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json is valid JSON",
+            reasons_for_failure=str(exc),
+        )
+
+    endpoints = contract.get("endpoints")
+    if not isinstance(endpoints, list) or not endpoints:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json declares endpoint contracts",
+            reasons_for_failure="contract.json must include a non-empty 'endpoints' array.",
+        )
+
+    has_post = any(str(endpoint.get("method", "")).upper() == "POST" for endpoint in endpoints)
+    has_get = any(str(endpoint.get("method", "")).upper() == "GET" for endpoint in endpoints)
+    if not has_post or not has_get:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json includes create and read/list flows",
+            reasons_for_failure="The contract must include at least one POST endpoint and one GET endpoint for round-trip verification.",
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="contract.json exists and declares executable flows",
+        stdout=json.dumps({"endpoint_count": len(endpoints)}, indent=2),
+    )
+
+
+def verify_e2e_steps_declared(workspace: Path) -> VerificationReport:
+    contract_path = workspace / "contract.json"
+    try:
+        contract = json.loads(contract_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json declares executable E2E steps",
+            reasons_for_failure=str(exc),
+        )
+
+    steps = contract.get("e2e_steps")
+    if not isinstance(steps, list) or not steps:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json declares executable E2E steps",
+            reasons_for_failure=(
+                "Missing non-empty e2e_steps. Deterministic E2E must execute every required "
+                "success flow, state transition, persistence check, and negative case."
+            ),
+        )
+
+    findings: list[str] = []
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            findings.append(f"step {index}: must be an object")
+            continue
+        for key in ("name", "method", "path", "expected_status"):
+            if key not in step:
+                findings.append(f"step {index}: missing {key}")
+        if "assertions" in step and not isinstance(step["assertions"], list):
+            findings.append(f"step {index}: assertions must be an array")
+        for assertion_index, assertion in enumerate(step.get("assertions", []), start=1):
+            if not isinstance(assertion, dict):
+                findings.append(f"step {index} assertion {assertion_index}: must be an object")
+                continue
+            path = assertion.get("path")
+            if path is not None and not (isinstance(path, str) and (path.startswith("$.") or path.startswith("$[*]."))):
+                findings.append(
+                    f"step {index} assertion {assertion_index}: unsupported path {path!r}; "
+                    "use $.field or $[*].field"
+                )
+        if "headers" in step and not isinstance(step["headers"], dict):
+            findings.append(f"step {index}: headers must be an object")
+        if "captures" in step and not isinstance(step["captures"], dict):
+            findings.append(f"step {index}: captures must be an object")
+
+    endpoints = contract.get("endpoints", [])
+    endpoint_pairs = {
+        (str(endpoint.get("method", "")).upper(), normalize_contract_path(str(endpoint.get("path", ""))))
+        for endpoint in endpoints
+        if isinstance(endpoint, dict)
+    }
+    step_pairs = {
+        (str(step.get("method", "")).upper(), normalize_contract_path(str(step.get("path", ""))))
+        for step in steps
+        if isinstance(step, dict)
+    }
+    missing_endpoint_steps = sorted(endpoint_pairs - step_pairs)
+    for method, path in missing_endpoint_steps:
+        findings.append(f"no e2e_steps coverage for endpoint {method} {path}")
+
+    negative_cases = contract.get("negative_cases", [])
+    if isinstance(negative_cases, list):
+        declared_negative_cases = {
+            str(case.get("case"))
+            for case in negative_cases
+            if isinstance(case, dict) and case.get("case")
+        }
+        covered_negative_cases = {
+            str(step.get("covers_negative_case"))
+            for step in steps
+            if isinstance(step, dict) and step.get("covers_negative_case")
+        }
+        for case_name in sorted(declared_negative_cases - covered_negative_cases):
+            findings.append(f"no e2e_steps coverage for negative case {case_name}")
+
+    captured_names = {
+        str(name)
+        for step in steps
+        if isinstance(step, dict) and isinstance(step.get("captures"), dict)
+        for name in step["captures"]
+    }
+    serialized_headers = json.dumps([step.get("headers", {}) for step in steps if isinstance(step, dict)])
+    for placeholder in sorted(set(re.findall(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", serialized_headers))):
+        if "token" in placeholder.lower() and placeholder not in captured_names:
+            findings.append(f"auth header placeholder {placeholder} must be captured from an earlier response")
+
+    if findings:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json declares executable E2E steps",
+            stdout="\n".join(findings),
+            reasons_for_failure="The E2E contract is incomplete or malformed.",
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="contract.json declares executable E2E steps",
+        stdout=json.dumps({"e2e_step_count": len(steps)}, indent=2),
+    )
+
+
+def scan_for_shortcuts(workspace: Path) -> VerificationReport:
+    findings: list[str] = []
+
+    for path in iter_source_files(workspace):
+        rel = path.relative_to(workspace)
+        text = path.read_text(errors="ignore")
+        normalized = text.replace("\n", " ")
+
+        if path.suffix == ".py":
+            if re.search(r"\bDB_PATH\s*=\s*[\"'][^/\\\"']+\.db[\"']", text):
+                findings.append(f"{rel}: SQLite DB_PATH is a plain relative path")
+            if re.search(r"SELECT\s+COUNT\(\*\).*?INSERT\s+INTO", normalized, re.IGNORECASE | re.DOTALL):
+                findings.append(f"{rel}: application appears to seed data when a table is empty")
+            if "pytest.skip" in text or "@pytest.mark.skip" in text:
+                findings.append(f"{rel}: test suite contains skipped pytest tests")
+
+        if path.suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            if re.search(r"useState\s*\(\s*\[\s*[{\"'`0-9]", normalized):
+                findings.append(f"{rel}: React state appears to start with hardcoded display data")
+            if re.search(r"\b(?:test|it|describe)\.skip\s*\(", text):
+                findings.append(f"{rel}: frontend tests contain skipped test blocks")
+
+    frontend_files = [
+        path for path in iter_source_files(workspace) if path.suffix in {".js", ".jsx", ".ts", ".tsx"}
+    ]
+    if frontend_files and not any("fetch(" in path.read_text(errors="ignore") for path in frontend_files):
+        findings.append("frontend: no fetch() call found; UI must retrieve data from the generated backend")
+
+    if findings:
+        return VerificationReport(
+            success=False,
+            test_summary="static anti-shortcut scan",
+            stdout="\n".join(findings),
+            reasons_for_failure="Generated project contains shortcuts that can make verification pass without real functionality.",
+        )
+
+    return VerificationReport(success=True, test_summary="static anti-shortcut scan")
+
+
+IMPORT_TO_REQUIREMENT = {
+    "dotenv": "python-dotenv",
+    "fastapi": "fastapi",
+    "httpx": "httpx",
+    "jose": "python-jose",
+    "jwt": "pyjwt",
+    "passlib": "passlib",
+    "pydantic": "pydantic",
+    "pytest": "pytest",
+    "redis": "redis",
+    "sqlalchemy": "sqlalchemy",
+    "uvicorn": "uvicorn",
+}
+
+
+def verify_backend_dependency_manifest(workspace: Path) -> VerificationReport:
+    backend = backend_dir(workspace)
+    requirements_path = backend / "requirements.txt"
+    if not requirements_path.exists():
+        return VerificationReport(
+            success=False,
+            test_summary="backend Python dependencies are declared",
+            reasons_for_failure=(
+                "Missing generated_project/backend/requirements.txt. Generated backend code must "
+                "declare every third-party package it imports so tests and E2E run in a clean environment."
+            ),
+        )
+
+    declared = parse_requirements(requirements_path)
+    imported = discover_backend_third_party_imports(backend)
+    imported.update({"pytest", "uvicorn"})
+    missing = sorted(imported - declared)
+    if missing:
+        return VerificationReport(
+            success=False,
+            test_summary="backend Python dependencies are declared",
+            stdout="\n".join(f"missing requirement: {package}" for package in missing),
+            reasons_for_failure=(
+                "backend/requirements.txt does not include all third-party imports used by backend code or tests."
+            ),
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="backend Python dependencies are declared",
+        stdout=json.dumps({"requirements": sorted(declared), "third_party_imports": sorted(imported)}, indent=2),
+    )
+
+
+def parse_requirements(path: Path) -> set[str]:
+    packages: set[str] = set()
+    for line in path.read_text(errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("-"):
+            continue
+        package = re.split(r"\s*(?:==|>=|<=|~=|!=|>|<|\[)", stripped, maxsplit=1)[0]
+        if package:
+            packages.add(canonical_package_name(package))
+    return packages
+
+
+def discover_backend_third_party_imports(backend: Path) -> set[str]:
+    local_modules = {path.stem for path in backend.glob("*.py")}
+    local_modules.update(path.name for path in backend.iterdir() if path.is_dir())
+    imports: set[str] = set()
+
+    for path in iter_source_files(backend):
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(errors="ignore"))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            module_name: str | None = None
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = alias.name.split(".")[0]
+                    maybe_add_requirement(module_name, local_modules, imports)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    continue
+                if node.module:
+                    module_name = node.module.split(".")[0]
+                    maybe_add_requirement(module_name, local_modules, imports)
+
+    return imports
+
+
+def maybe_add_requirement(module_name: str, local_modules: set[str], imports: set[str]) -> None:
+    if module_name in local_modules:
+        return
+    if module_name in sys.builtin_module_names:
+        return
+    if module_name in getattr(sys, "stdlib_module_names", set()):
+        return
+    if module_name.startswith("_"):
+        return
+    imports.add(canonical_package_name(IMPORT_TO_REQUIREMENT.get(module_name, module_name)))
+
+
+def canonical_package_name(package: str) -> str:
+    return package.strip().lower().replace("_", "-")
+
+
+def verify_generated_tests(workspace: Path) -> VerificationReport:
+    backend = backend_dir(workspace)
+    test_files = [
+        path for path in iter_source_files(backend) if path.name.startswith("test_") and path.suffix == ".py"
+    ]
+    if not test_files:
+        return VerificationReport(
+            success=False,
+            test_summary="pytest suite exists",
+            reasons_for_failure="No backend pytest files named test_*.py were generated.",
+        )
+
+    text = "\n".join(path.read_text(errors="ignore") for path in test_files)
+    required_patterns = {
+        "POST create flow": r"\.post\s*\(",
+        "GET read/list flow": r"\.get\s*\(",
+        "round-trip assertions": r"assert\s+.*\[\s*[\"'](?:id|user_id|task_id|email|username|name|title|owner|status)[\"']\s*\]",
+        "validation/error assertions": r"assert\s+.*status_code\s*==\s*4\d\d",
+    }
+    missing = [name for name, pattern in required_patterns.items() if not re.search(pattern, text)]
+    if missing:
+        return VerificationReport(
+            success=False,
+            test_summary="pytest suite covers required data flows",
+            reasons_for_failure="Missing test coverage for: " + ", ".join(missing),
+        )
+
+    result = run_backend_python_command(workspace, ["python", "-m", "pytest", "-q"], timeout=180)
+    return VerificationReport(
+        success=result.returncode == 0,
+        test_summary="pytest execution",
+        stdout=result.stdout,
+        stderr=result.stderr,
+        reasons_for_failure=None if result.returncode == 0 else f"pytest exited with {result.returncode}",
+    )
+
+
+def verify_frontend_build(workspace: Path) -> VerificationReport:
+    frontend = frontend_dir(workspace)
+    if not (frontend / "package.json").exists():
+        return VerificationReport(success=True, test_summary="frontend build skipped; no package.json")
+
+    install = ensure_frontend_dependencies(frontend)
+    if not install.success:
+        return install
+
+    result = run_command(["npm", "run", "build"], cwd=frontend, timeout=180)
+    return VerificationReport(
+        success=result.returncode == 0,
+        test_summary="frontend production build",
+        stdout=result.stdout,
+        stderr=result.stderr,
+        reasons_for_failure=None if result.returncode == 0 else f"npm run build exited with {result.returncode}",
+    )
+
+
+def verify_contract_e2e(workspace: Path) -> VerificationReport:
+    contract = json.loads((workspace / "contract.json").read_text())
+    config = read_config(workspace)
+    backend = backend_dir(workspace)
+    frontend = frontend_dir(workspace)
+    backend_port = int(config.get("backend_port", 8000))
+    frontend_port = int(config.get("frontend_port", 5173))
+    backend_base = f"http://127.0.0.1:{backend_port}"
+    frontend_base = f"http://127.0.0.1:{frontend_port}"
+    transcript: list[str] = []
+
+    try:
+        if (frontend / "package.json").exists():
+            install = ensure_frontend_dependencies(frontend)
+            if not install.success:
+                return install
+
+        if not wait_for_url(f"{backend_base}/docs", timeout=1):
+            pid = start_persistent_process(
+                backend_python_command(workspace, [
+                    "python",
+                    "-m",
+                    "uvicorn",
+                    "main:app",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(backend_port),
+                ]),
+                cwd=backend,
+                log_path=workspace / "backend.log",
+                pid_path=workspace / "backend.pid",
+            )
+            transcript.append(f"Started backend on port {backend_port} with PID {pid}.")
+        if not wait_for_url(f"{backend_base}/docs", timeout=20):
+            return VerificationReport(
+                success=False,
+                test_summary="backend starts for contract E2E",
+                stdout="\n".join(transcript),
+                reasons_for_failure=f"Backend did not serve /docs on port {backend_port}.",
+            )
+
+        if (frontend / "package.json").exists() and not wait_for_url(frontend_base, timeout=1):
+            pid = start_persistent_process(
+                ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(frontend_port)],
+                cwd=frontend,
+                log_path=workspace / "frontend.log",
+                pid_path=workspace / "frontend.pid",
+            )
+            transcript.append(f"Started frontend on port {frontend_port} with PID {pid}.")
+
+        run_contract_e2e_steps(contract, backend_base, transcript)
+
+        if (frontend / "package.json").exists():
+            if not wait_for_url(frontend_base, timeout=25):
+                return VerificationReport(
+                    success=False,
+                    test_summary="frontend starts for contract E2E",
+                    stdout="\n".join(transcript),
+                    reasons_for_failure=f"Frontend did not serve / on port {frontend_port}.",
+                )
+            status, body = http_request("GET", frontend_base)
+            transcript.append(f"GET {frontend_base} -> HTTP {status}\n{body[:500]}")
+            if status != 200:
+                raise AssertionError(f"Frontend root returned HTTP {status}")
+
+    except Exception as exc:
+        return VerificationReport(
+            success=False,
+            test_summary="contract-driven black-box E2E",
+            stdout="\n".join(transcript),
+            reasons_for_failure=str(exc),
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="contract-driven black-box E2E; services left running",
+        stdout="\n".join(transcript),
+    )
+
+
+def start_persistent_process(command: list[str], cwd: Path, log_path: Path, pid_path: Path) -> int:
+    log_file = log_path.open("a")
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        text=True,
+    )
+    pid_path.write_text(str(process.pid))
+    log_file.close()
+    return process.pid
+
+
+def ensure_frontend_dependencies(frontend: Path) -> VerificationReport:
+    if (frontend / "node_modules" / ".bin" / "vite").exists():
+        return VerificationReport(success=True, test_summary="frontend dependencies already installed")
+
+    command = ["npm", "ci"] if (frontend / "package-lock.json").exists() else ["npm", "install"]
+    result = run_command(command, cwd=frontend, timeout=240)
+    return VerificationReport(
+        success=result.returncode == 0,
+        test_summary="frontend dependency installation",
+        stdout=result.stdout,
+        stderr=result.stderr,
+        reasons_for_failure=None if result.returncode == 0 else f"{' '.join(command)} exited with {result.returncode}",
+    )
+
+
+def backend_python_command(workspace: Path, command: list[str]) -> list[str]:
+    requirements = backend_dir(workspace) / "requirements.txt"
+    if requirements.exists():
+        return ["uv", "run", "--isolated", "--with-requirements", "requirements.txt", *command]
+    return command
+
+
+def run_backend_python_command(workspace: Path, command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    return run_command(backend_python_command(workspace, command), cwd=backend_dir(workspace), timeout=timeout)
+
+
+def run_contract_e2e_steps(contract: dict[str, Any], backend_base: str, transcript: list[str]) -> None:
+    steps = contract.get("e2e_steps")
+    if not isinstance(steps, list) or not steps:
+        raise AssertionError("contract.json must include non-empty e2e_steps for deterministic E2E.")
+
+    context = build_placeholder_context(steps)
+    transcript.append(f"E2E placeholder context: {json.dumps(context, sort_keys=True)}")
+
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise AssertionError(f"E2E step {index} is not an object.")
+
+        name = str(step.get("name") or f"step_{index}")
+        method = str(step.get("method", "")).upper()
+        if not method:
+            raise AssertionError(f"E2E step {name} is missing method.")
+
+        path = resolve_placeholders(str(step.get("path", "")), context)
+        if not path.startswith("/"):
+            raise AssertionError(f"E2E step {name} path must start with '/'.")
+
+        payload = step.get("payload")
+        resolved_payload = resolve_placeholders(payload, context) if payload is not None else None
+        headers = step.get("headers")
+        resolved_headers = resolve_placeholders(headers, context) if isinstance(headers, dict) else None
+        status, body = http_request(method, backend_base + path, resolved_payload, headers=resolved_headers)
+        transcript.append(
+            f"E2E step {index} {name}: {method} {path} "
+            f"{json.dumps(resolved_payload) if resolved_payload is not None else ''}-> HTTP {status}\n{body}"
+        )
+
+        expected_status = int(step["expected_status"])
+        if status != expected_status:
+            raise AssertionError(f"E2E step {name} returned HTTP {status}, expected {expected_status}.")
+
+        assertions = step.get("assertions", [])
+        parsed_body = None
+        if assertions:
+            parsed_body = parse_json_body(body, name)
+            for assertion in assertions:
+                evaluate_e2e_assertion(assertion, parsed_body, body, context, name)
+        elif body.strip():
+            try:
+                parsed_body = json.loads(body)
+            except json.JSONDecodeError:
+                parsed_body = None
+
+        if parsed_body is not None:
+            capture_e2e_values(step, parsed_body, context, name)
+
+
+def build_placeholder_context(steps: list[Any]) -> dict[str, str]:
+    serialized = json.dumps(steps)
+    names = sorted(set(re.findall(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", serialized)))
+    token = uuid.uuid4().hex[:8]
+    context: dict[str, str] = {"run_id": token}
+
+    for name in names:
+        lowered = name.lower()
+        if name in context:
+            continue
+        if "sku" in lowered:
+            context[name] = f"SKU-E2E-{token}"
+        elif "reservation" in lowered:
+            context[name] = f"RES-E2E-{token}-{len(context)}"
+        elif lowered.endswith("id") or lowered.endswith("_id") or lowered == "id":
+            context[name] = f"ID-E2E-{token}-{len(context)}"
+        elif "name" in lowered or "title" in lowered:
+            context[name] = f"E2E {token}"
+        else:
+            context[name] = f"E2E-{name}-{token}"
+
+    return context
+
+
+def resolve_placeholders(value: Any, context: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1).strip()
+            if name not in context:
+                raise AssertionError(f"No value available for placeholder {{{{{name}}}}}.")
+            return context[name]
+
+        return re.sub(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", replace, value)
+    if isinstance(value, list):
+        return [resolve_placeholders(item, context) for item in value]
+    if isinstance(value, dict):
+        return {key: resolve_placeholders(item, context) for key, item in value.items()}
+    return value
+
+
+def parse_json_body(body: str, step_name: str) -> Any:
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"E2E step {step_name} response was not valid JSON: {exc}") from exc
+
+
+def evaluate_e2e_assertion(
+    assertion: dict[str, Any],
+    parsed_body: Any,
+    raw_body: str,
+    context: dict[str, str],
+    step_name: str,
+) -> None:
+    if not isinstance(assertion, dict):
+        raise AssertionError(f"E2E step {step_name} has a non-object assertion.")
+
+    if "body_contains" in assertion:
+        expected_text = str(resolve_placeholders(assertion["body_contains"], context))
+        if expected_text not in raw_body:
+            raise AssertionError(f"E2E step {step_name} body did not contain {expected_text!r}.")
+        return
+
+    path = assertion.get("path")
+    if not isinstance(path, str):
+        raise AssertionError(f"E2E step {step_name} assertion is missing string path.")
+    values = json_path_values(parsed_body, path)
+
+    if "equals" in assertion:
+        expected = resolve_placeholders(assertion["equals"], context)
+        if not values:
+            raise AssertionError(f"E2E step {step_name} assertion path {path} produced no values.")
+        if values[0] != expected:
+            raise AssertionError(
+                f"E2E step {step_name} expected {path} == {expected!r}, got {values[0]!r}."
+            )
+        return
+
+    if "contains" in assertion:
+        expected = resolve_placeholders(assertion["contains"], context)
+        if expected not in values:
+            raise AssertionError(
+                f"E2E step {step_name} expected {path} to contain {expected!r}, got {values!r}."
+            )
+        return
+
+    raise AssertionError(f"E2E step {step_name} assertion must use equals, contains, or body_contains.")
+
+
+def capture_e2e_values(step: dict[str, Any], parsed_body: Any, context: dict[str, str], step_name: str) -> None:
+    captures = step.get("captures", {})
+    if captures:
+        if not isinstance(captures, dict):
+            raise AssertionError(f"E2E step {step_name} captures must be an object.")
+        for name, path in captures.items():
+            if not isinstance(name, str) or not isinstance(path, str):
+                raise AssertionError(f"E2E step {step_name} captures must map string names to string paths.")
+            values = json_path_values(parsed_body, path)
+            if not values:
+                raise AssertionError(f"E2E step {step_name} capture path {path} produced no values.")
+            context[name] = str(values[0])
+
+    if isinstance(parsed_body, dict):
+        for name in list(context):
+            if name in parsed_body and isinstance(parsed_body[name], (str, int, float, bool)):
+                context[name] = str(parsed_body[name])
+
+
+def json_path_values(document: Any, path: str) -> list[Any]:
+    if path.startswith("$[*]."):
+        field_path = path[len("$[*].") :].split(".")
+        if not isinstance(document, list):
+            return []
+        return [value for item in document for value in extract_field_values(item, field_path)]
+
+    if path.startswith("$."):
+        return extract_field_values(document, path[len("$.") :].split("."))
+
+    raise AssertionError(f"Unsupported assertion path {path!r}. Supported paths: $.field and $[*].field.")
+
+
+def extract_field_values(value: Any, fields: list[str]) -> list[Any]:
+    current = value
+    for field in fields:
+        if not isinstance(current, dict) or field not in current:
+            return []
+        current = current[field]
+    return [current]
+
+
+def normalize_contract_path(path: str) -> str:
+    path = re.sub(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", r"{\1}", path)
+    return re.sub(r"{[^}]+}", "{}", path)
+
+
+def run_create_flow(contract: dict[str, Any], backend_base: str, transcript: list[str]) -> tuple[dict[str, Any], str]:
+    create_endpoint = next(
+        (
+            endpoint
+            for endpoint in contract["endpoints"]
+            if str(endpoint.get("method", "")).upper() == "POST"
+        ),
+        None,
+    )
+    if not create_endpoint:
+        raise AssertionError("No POST endpoint in contract.")
+
+    sentinel = f"contract_{uuid.uuid4().hex[:10]}"
+    payload = inject_sentinel(dict(create_endpoint.get("valid_payload") or create_endpoint.get("payload") or {}), sentinel)
+    if not payload:
+        raise AssertionError("POST endpoint contract must include valid_payload or payload.")
+
+    status, body = http_request("POST", backend_base + create_endpoint["path"], payload)
+    transcript.append(f"POST {create_endpoint['path']} {json.dumps(payload)} -> HTTP {status}\n{body}")
+    expected = create_endpoint.get("expected_status")
+    if expected is not None:
+        if status != int(expected):
+            raise AssertionError(f"POST {create_endpoint['path']} returned HTTP {status}, expected {expected}.")
+    elif status < 200 or status >= 300:
+        raise AssertionError(f"POST {create_endpoint['path']} returned HTTP {status}.")
+    if sentinel not in body:
+        raise AssertionError("Create response did not contain the random sentinel value.")
+    return payload, sentinel
+
+
+def run_get_flows(
+    contract: dict[str, Any],
+    backend_base: str,
+    created_payload: dict[str, Any],
+    sentinel: str,
+    transcript: list[str],
+) -> None:
+    get_endpoints = [
+        endpoint for endpoint in contract["endpoints"] if str(endpoint.get("method", "")).upper() == "GET"
+    ]
+    if not get_endpoints:
+        raise AssertionError("No GET endpoint in contract.")
+
+    saw_sentinel = False
+    for endpoint in get_endpoints:
+        path = fill_path_params(endpoint["path"], created_payload)
+        status, body = http_request("GET", backend_base + path)
+        transcript.append(f"GET {path} -> HTTP {status}\n{body}")
+        if status != int(endpoint.get("expected_status", 200)):
+            raise AssertionError(f"GET {path} returned HTTP {status}.")
+        if sentinel in body:
+            saw_sentinel = True
+
+    if not saw_sentinel:
+        raise AssertionError("No GET endpoint returned the random record created during E2E verification.")
+
+
+def inject_sentinel(payload: dict[str, Any], sentinel: str) -> dict[str, Any]:
+    for key, value in list(payload.items()):
+        lowered = key.lower()
+        if isinstance(value, dict):
+            payload[key] = inject_sentinel(value, sentinel)
+        elif isinstance(value, str):
+            if "email" in lowered:
+                payload[key] = f"{sentinel}@example.com"
+            elif lowered in {"id", "user_id", "profile_id"} or lowered.endswith("_id"):
+                payload[key] = sentinel
+            elif any(token in lowered for token in ["name", "title", "username"]):
+                payload[key] = sentinel
+    return payload
+
+
+def fill_path_params(path: str, payload: dict[str, Any]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key in payload:
+            return str(payload[key])
+        if key == "id":
+            for candidate in ("id", "user_id", "profile_id"):
+                if candidate in payload:
+                    return str(payload[candidate])
+        raise AssertionError(f"Cannot fill path parameter {{{key}}} from created payload.")
+
+    return re.sub(r"{([^}]+)}", replace, path)
+
+
+def read_config(workspace: Path) -> dict[str, Any]:
+    path = workspace / "config.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def backend_dir(workspace: Path) -> Path:
+    return workspace / "backend"
+
+
+def frontend_dir(workspace: Path) -> Path:
+    return workspace / "frontend"
+
+
+def http_request(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    data = None
+    request_headers = {str(key): str(value) for key, value in (headers or {}).items()}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urlopen(request, timeout=10) as response:
+            return response.status, response.read().decode("utf-8", errors="replace")
+    except URLError as exc:
+        if hasattr(exc, "code") and hasattr(exc, "read"):
+            return int(exc.code), exc.read().decode("utf-8", errors="replace")
+        raise
+
+
+def wait_for_url(url: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status, _ = http_request("GET", url)
+            if 200 <= status < 500:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def run_command(command: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def iter_source_files(workspace: Path) -> list[Path]:
+    files: list[Path] = []
+    for root, dirs, names in os.walk(workspace):
+        dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS]
+        for name in names:
+            path = Path(root) / name
+            if path.suffix in {".py", ".js", ".jsx", ".ts", ".tsx"}:
+                files.append(path)
+    return files
+
+
+def iter_generated_text_files(workspace: Path) -> list[Path]:
+    allowed_suffixes = {
+        ".css",
+        ".html",
+        ".js",
+        ".jsx",
+        ".json",
+        ".md",
+        ".mjs",
+        ".py",
+        ".sh",
+        ".ts",
+        ".tsx",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+    files: list[Path] = []
+    for root, dirs, names in os.walk(workspace):
+        dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS]
+        for name in names:
+            path = Path(root) / name
+            if path.suffix in allowed_suffixes:
+                files.append(path)
+    return files
