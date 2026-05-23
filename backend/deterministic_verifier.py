@@ -55,6 +55,7 @@ def verify_generated_project(workspace_path: str, role: str) -> VerificationRepo
     if role == "E2E_VERIFIER":
         checks.extend(
             [
+                verify_e2e_steps_declared(workspace),
                 verify_frontend_build(workspace),
                 verify_contract_e2e(workspace),
             ]
@@ -188,6 +189,84 @@ def verify_contract_exists(workspace: Path) -> VerificationReport:
         success=True,
         test_summary="contract.json exists and declares executable flows",
         stdout=json.dumps({"endpoint_count": len(endpoints)}, indent=2),
+    )
+
+
+def verify_e2e_steps_declared(workspace: Path) -> VerificationReport:
+    contract_path = workspace / "contract.json"
+    try:
+        contract = json.loads(contract_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json declares executable E2E steps",
+            reasons_for_failure=str(exc),
+        )
+
+    steps = contract.get("e2e_steps")
+    if not isinstance(steps, list) or not steps:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json declares executable E2E steps",
+            reasons_for_failure=(
+                "Missing non-empty e2e_steps. Deterministic E2E must execute every required "
+                "success flow, state transition, persistence check, and negative case."
+            ),
+        )
+
+    findings: list[str] = []
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            findings.append(f"step {index}: must be an object")
+            continue
+        for key in ("name", "method", "path", "expected_status"):
+            if key not in step:
+                findings.append(f"step {index}: missing {key}")
+        if "assertions" in step and not isinstance(step["assertions"], list):
+            findings.append(f"step {index}: assertions must be an array")
+
+    endpoints = contract.get("endpoints", [])
+    endpoint_pairs = {
+        (str(endpoint.get("method", "")).upper(), normalize_contract_path(str(endpoint.get("path", ""))))
+        for endpoint in endpoints
+        if isinstance(endpoint, dict)
+    }
+    step_pairs = {
+        (str(step.get("method", "")).upper(), normalize_contract_path(str(step.get("path", ""))))
+        for step in steps
+        if isinstance(step, dict)
+    }
+    missing_endpoint_steps = sorted(endpoint_pairs - step_pairs)
+    for method, path in missing_endpoint_steps:
+        findings.append(f"no e2e_steps coverage for endpoint {method} {path}")
+
+    negative_cases = contract.get("negative_cases", [])
+    if isinstance(negative_cases, list):
+        declared_negative_cases = {
+            str(case.get("case"))
+            for case in negative_cases
+            if isinstance(case, dict) and case.get("case")
+        }
+        covered_negative_cases = {
+            str(step.get("covers_negative_case"))
+            for step in steps
+            if isinstance(step, dict) and step.get("covers_negative_case")
+        }
+        for case_name in sorted(declared_negative_cases - covered_negative_cases):
+            findings.append(f"no e2e_steps coverage for negative case {case_name}")
+
+    if findings:
+        return VerificationReport(
+            success=False,
+            test_summary="contract.json declares executable E2E steps",
+            stdout="\n".join(findings),
+            reasons_for_failure="The E2E contract is incomplete or malformed.",
+        )
+
+    return VerificationReport(
+        success=True,
+        test_summary="contract.json declares executable E2E steps",
+        stdout=json.dumps({"e2e_step_count": len(steps)}, indent=2),
     )
 
 
@@ -328,8 +407,7 @@ def verify_contract_e2e(workspace: Path) -> VerificationReport:
             )
             transcript.append(f"Started frontend on port {frontend_port} with PID {pid}.")
 
-        created_payload, sentinel = run_create_flow(contract, backend_base, transcript)
-        run_get_flows(contract, backend_base, created_payload, sentinel, transcript)
+        run_contract_e2e_steps(contract, backend_base, transcript)
 
         if (frontend / "package.json").exists():
             if not wait_for_url(frontend_base, timeout=25):
@@ -388,6 +466,162 @@ def ensure_frontend_dependencies(frontend: Path) -> VerificationReport:
         stderr=result.stderr,
         reasons_for_failure=None if result.returncode == 0 else f"{' '.join(command)} exited with {result.returncode}",
     )
+
+
+def run_contract_e2e_steps(contract: dict[str, Any], backend_base: str, transcript: list[str]) -> None:
+    steps = contract.get("e2e_steps")
+    if not isinstance(steps, list) or not steps:
+        raise AssertionError("contract.json must include non-empty e2e_steps for deterministic E2E.")
+
+    context = build_placeholder_context(steps)
+    transcript.append(f"E2E placeholder context: {json.dumps(context, sort_keys=True)}")
+
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise AssertionError(f"E2E step {index} is not an object.")
+
+        name = str(step.get("name") or f"step_{index}")
+        method = str(step.get("method", "")).upper()
+        if not method:
+            raise AssertionError(f"E2E step {name} is missing method.")
+
+        path = resolve_placeholders(str(step.get("path", "")), context)
+        if not path.startswith("/"):
+            raise AssertionError(f"E2E step {name} path must start with '/'.")
+
+        payload = step.get("payload")
+        resolved_payload = resolve_placeholders(payload, context) if payload is not None else None
+        status, body = http_request(method, backend_base + path, resolved_payload)
+        transcript.append(
+            f"E2E step {index} {name}: {method} {path} "
+            f"{json.dumps(resolved_payload) if resolved_payload is not None else ''}-> HTTP {status}\n{body}"
+        )
+
+        expected_status = int(step["expected_status"])
+        if status != expected_status:
+            raise AssertionError(f"E2E step {name} returned HTTP {status}, expected {expected_status}.")
+
+        assertions = step.get("assertions", [])
+        if assertions:
+            parsed_body = parse_json_body(body, name)
+            for assertion in assertions:
+                evaluate_e2e_assertion(assertion, parsed_body, body, context, name)
+
+
+def build_placeholder_context(steps: list[Any]) -> dict[str, str]:
+    serialized = json.dumps(steps)
+    names = sorted(set(re.findall(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", serialized)))
+    token = uuid.uuid4().hex[:8]
+    context: dict[str, str] = {"run_id": token}
+
+    for name in names:
+        lowered = name.lower()
+        if name in context:
+            continue
+        if "sku" in lowered:
+            context[name] = f"SKU-E2E-{token}"
+        elif "reservation" in lowered:
+            context[name] = f"RES-E2E-{token}-{len(context)}"
+        elif lowered.endswith("id") or lowered.endswith("_id") or lowered == "id":
+            context[name] = f"ID-E2E-{token}-{len(context)}"
+        elif "name" in lowered or "title" in lowered:
+            context[name] = f"E2E {token}"
+        else:
+            context[name] = f"E2E-{name}-{token}"
+
+    return context
+
+
+def resolve_placeholders(value: Any, context: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1).strip()
+            if name not in context:
+                raise AssertionError(f"No value available for placeholder {{{{{name}}}}}.")
+            return context[name]
+
+        return re.sub(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", replace, value)
+    if isinstance(value, list):
+        return [resolve_placeholders(item, context) for item in value]
+    if isinstance(value, dict):
+        return {key: resolve_placeholders(item, context) for key, item in value.items()}
+    return value
+
+
+def parse_json_body(body: str, step_name: str) -> Any:
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"E2E step {step_name} response was not valid JSON: {exc}") from exc
+
+
+def evaluate_e2e_assertion(
+    assertion: dict[str, Any],
+    parsed_body: Any,
+    raw_body: str,
+    context: dict[str, str],
+    step_name: str,
+) -> None:
+    if not isinstance(assertion, dict):
+        raise AssertionError(f"E2E step {step_name} has a non-object assertion.")
+
+    if "body_contains" in assertion:
+        expected_text = str(resolve_placeholders(assertion["body_contains"], context))
+        if expected_text not in raw_body:
+            raise AssertionError(f"E2E step {step_name} body did not contain {expected_text!r}.")
+        return
+
+    path = assertion.get("path")
+    if not isinstance(path, str):
+        raise AssertionError(f"E2E step {step_name} assertion is missing string path.")
+    values = json_path_values(parsed_body, path)
+
+    if "equals" in assertion:
+        expected = resolve_placeholders(assertion["equals"], context)
+        if not values:
+            raise AssertionError(f"E2E step {step_name} assertion path {path} produced no values.")
+        if values[0] != expected:
+            raise AssertionError(
+                f"E2E step {step_name} expected {path} == {expected!r}, got {values[0]!r}."
+            )
+        return
+
+    if "contains" in assertion:
+        expected = resolve_placeholders(assertion["contains"], context)
+        if expected not in values:
+            raise AssertionError(
+                f"E2E step {step_name} expected {path} to contain {expected!r}, got {values!r}."
+            )
+        return
+
+    raise AssertionError(f"E2E step {step_name} assertion must use equals, contains, or body_contains.")
+
+
+def json_path_values(document: Any, path: str) -> list[Any]:
+    if path.startswith("$[*]."):
+        field_path = path[len("$[*].") :].split(".")
+        if not isinstance(document, list):
+            return []
+        return [value for item in document for value in extract_field_values(item, field_path)]
+
+    if path.startswith("$."):
+        return extract_field_values(document, path[len("$.") :].split("."))
+
+    raise AssertionError(f"Unsupported assertion path {path!r}. Supported paths: $.field and $[*].field.")
+
+
+def extract_field_values(value: Any, fields: list[str]) -> list[Any]:
+    current = value
+    for field in fields:
+        if not isinstance(current, dict) or field not in current:
+            return []
+        current = current[field]
+    return [current]
+
+
+def normalize_contract_path(path: str) -> str:
+    path = re.sub(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}", r"{\1}", path)
+    return re.sub(r"{[^}]+}", "{}", path)
 
 
 def run_create_flow(contract: dict[str, Any], backend_base: str, transcript: list[str]) -> tuple[dict[str, Any], str]:

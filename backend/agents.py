@@ -67,8 +67,16 @@ Follow these rules:
    - `endpoints`: an array of objects with `method`, `path`, `valid_payload`, and `expected_status` for every API behavior required by the design.
    - At least one POST endpoint and at least one GET endpoint that can prove a POSTed record can be read back.
    - Paths must use FastAPI-style placeholders when needed, e.g. `/profile/{user_id}`.
+   - `e2e_steps`: an ordered array that exercises EVERY required successful flow, state transition, persistence check, and negative/error case from the design.
+     Each step MUST include `name`, `method`, `path`, `expected_status`, and optionally `payload` plus `assertions`.
+     If the contract includes `negative_cases`, every negative case MUST have an `e2e_steps` entry with `covers_negative_case` set to that exact negative case `case` value.
+     Use `{{variable_name}}` placeholders to share random runtime values across steps, e.g. `{{sku}}`, `{{reservation_id}}`, or `/products/{{sku}}`.
+     Supported assertion forms are:
+       `{ "path": "$.field", "equals": <value> }`
+       `{ "path": "$[*].field", "contains": <value> }`
+       `{ "body_contains": <string> }`
    - `frontend_requirements`: an array describing which UI views must fetch which backend data.
-   This contract is the source of truth for deterministic verification. Do not omit it.
+   This contract is the source of truth for deterministic verification. Do not omit it. If a behavior is in the design but not in `e2e_steps`, the generated project is incomplete.
 5. When creating tasks, embed the explicit data flow contracts in each task description:
    - BACKEND task descriptions MUST list every endpoint required, including list endpoints (GET /profiles) if any UI component displays a collection.
    - FRONTEND task descriptions MUST list every API endpoint it will call and what data it expects back. It must NOT be given freedom to invent its own data sources.
@@ -174,8 +182,9 @@ Follow these STRICT rules — do NOT skip any step or simulate any result:
       → Must return 200 AND the response body must contain the record created in step (b). This proves DB → API data flow.
    d. `curl -s -o /dev/null -w "%{http_code}" http://localhost:<FRONTEND_PORT>/`
       → Must return 200. This proves the frontend is serving.
-6. Include the COMPLETE raw curl output for every command above in your `stdout` field.
-7. Set `success=True` ONLY if ALL four curl checks passed AND step (c) confirmed the created record appears in the list response.
-8. You MUST NOT invent, simulate, or summarize results. Paste the actual curl output.
-9. Your output MUST match the TaskVerificationOutput schema. Your success value is advisory only; the dispatcher will run deterministic checks after you finish.
+6. Execute EVERY object in `contract.json` `e2e_steps` in order. Do not stop after the first create/read/list path. The E2E is incomplete unless it covers every required success flow, state transition, persistence check, and negative/error case listed in the design.
+7. Include the COMPLETE raw curl output for every command above in your `stdout` field.
+8. Set `success=True` ONLY if ALL curl checks and ALL `e2e_steps` passed with their expected statuses and assertions.
+9. You MUST NOT invent, simulate, or summarize results. Paste the actual curl output.
+10. Your output MUST match the TaskVerificationOutput schema. Your success value is advisory only; the dispatcher will run deterministic checks after you finish.
 """

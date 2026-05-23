@@ -3,7 +3,9 @@ import textwrap
 
 from db import find_available_port
 from deterministic_verifier import (
+    evaluate_e2e_assertion,
     scan_for_shortcuts,
+    verify_e2e_steps_declared,
     verify_generated_project,
     verify_no_external_file_references,
     verify_workspace_layout,
@@ -34,6 +36,34 @@ def write_valid_contract(workspace):
                         "method": "GET",
                         "path": "/profiles",
                         "expected_status": 200,
+                    },
+                ],
+                "e2e_steps": [
+                    {
+                        "name": "create profile",
+                        "method": "POST",
+                        "path": "/profiles",
+                        "payload": {
+                            "user_id": "{{user_id}}",
+                            "username": "{{username}}",
+                            "email": "{{email}}",
+                        },
+                        "expected_status": 201,
+                        "assertions": [{"path": "$.email", "equals": "{{email}}"}],
+                    },
+                    {
+                        "name": "read profile",
+                        "method": "GET",
+                        "path": "/profiles/{{user_id}}",
+                        "expected_status": 200,
+                        "assertions": [{"path": "$.email", "equals": "{{email}}"}],
+                    },
+                    {
+                        "name": "list profiles",
+                        "method": "GET",
+                        "path": "/profiles",
+                        "expected_status": 200,
+                        "assertions": [{"path": "$[*].email", "contains": "{{email}}"}],
                     },
                 ],
                 "frontend_requirements": ["fetch profiles from GET /profiles"],
@@ -181,3 +211,66 @@ def test_deterministic_verifier_passes_valid_synthetic_workspace(tmp_path):
     report = verify_generated_project(str(tmp_path), "VERIFIER")
 
     assert report.success, report.model_dump()
+
+
+def test_e2e_contract_gate_requires_steps_for_every_endpoint(tmp_path):
+    write_valid_contract(tmp_path)
+    contract = json.loads((tmp_path / "contract.json").read_text())
+    contract["e2e_steps"] = contract["e2e_steps"][:1]
+    (tmp_path / "contract.json").write_text(json.dumps(contract))
+
+    report = verify_e2e_steps_declared(tmp_path)
+
+    assert not report.success
+    assert "no e2e_steps coverage" in report.stdout
+
+
+def test_e2e_contract_gate_requires_negative_case_steps(tmp_path):
+    write_valid_contract(tmp_path)
+    contract = json.loads((tmp_path / "contract.json").read_text())
+    contract["negative_cases"] = [{"case": "duplicate_profile", "expected_status": 400}]
+    (tmp_path / "contract.json").write_text(json.dumps(contract))
+
+    report = verify_e2e_steps_declared(tmp_path)
+
+    assert not report.success
+    assert "negative case duplicate_profile" in report.stdout
+
+    contract["e2e_steps"].append(
+        {
+            "name": "duplicate profile fails",
+            "method": "POST",
+            "path": "/profiles",
+            "payload": {
+                "user_id": "{{user_id}}",
+                "username": "{{username}}",
+                "email": "{{email}}",
+            },
+            "expected_status": 400,
+            "covers_negative_case": "duplicate_profile",
+        }
+    )
+    (tmp_path / "contract.json").write_text(json.dumps(contract))
+
+    report = verify_e2e_steps_declared(tmp_path)
+
+    assert report.success, report.model_dump()
+
+
+def test_e2e_assertions_support_exact_and_list_contains():
+    context = {"sku": "SKU-123"}
+
+    evaluate_e2e_assertion(
+        {"path": "$.available_stock", "equals": 6},
+        {"available_stock": 6},
+        '{"available_stock": 6}',
+        context,
+        "stock check",
+    )
+    evaluate_e2e_assertion(
+        {"path": "$[*].sku", "contains": "{{sku}}"},
+        [{"sku": "OTHER"}, {"sku": "SKU-123"}],
+        '[{"sku": "OTHER"}, {"sku": "SKU-123"}]',
+        context,
+        "list check",
+    )

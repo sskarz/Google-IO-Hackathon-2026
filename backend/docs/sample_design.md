@@ -84,6 +84,33 @@ The architect must write `generated_project/contract.json` with every endpoint a
 
 The contract must also describe negative cases for insufficient stock, duplicate product SKU, duplicate reservation ID, non-positive stock, non-positive quantity, missing product, and repeated release or commit of a non-active reservation.
 
+The contract must include an ordered `e2e_steps` array that deterministic verification can run without interpreting prose. These steps must use runtime placeholders like `{{sku}}`, `{{release_reservation_id}}`, and `{{commit_reservation_id}}`, and must cover:
+
+1. Create a product with stock `10`; assert `available_stock == 10`.
+2. Read that product by SKU; assert `available_stock == 10`.
+3. Reserve quantity `4` with `release_reservation_id`; assert reservation `status == active` and response `available_stock == 6`.
+4. Attempt to reserve quantity `7` with a different reservation ID; assert HTTP `400`.
+5. Release `release_reservation_id`; assert reservation `status == released`.
+6. Read the product again; assert `available_stock == 10`.
+7. Reserve quantity `4` with `commit_reservation_id`; assert `available_stock == 6`.
+8. Commit `commit_reservation_id`; assert reservation `status == committed`.
+9. Read the product again; assert `available_stock == 6`.
+10. List reservations; assert the list contains both reservation IDs.
+11. Attempt duplicate product SKU; assert HTTP `400` and set `covers_negative_case` to `duplicate_product_sku`.
+12. Attempt duplicate reservation ID; assert HTTP `400` and set `covers_negative_case` to `duplicate_reservation_id`.
+13. Attempt non-positive stock; assert HTTP `400` and set `covers_negative_case` to `non_positive_stock`.
+14. Attempt non-positive quantity; assert HTTP `400` and set `covers_negative_case` to `non_positive_quantity`.
+15. Attempt reservation for a missing product; assert HTTP `404` and set `covers_negative_case` to `missing_product`.
+16. Attempt repeated release or commit against a non-active reservation; assert HTTP `400` and set `covers_negative_case` to `repeated_release_or_commit`.
+
+Every object in `negative_cases` must have a matching `e2e_steps` object whose `covers_negative_case` value exactly matches the negative case `case` value.
+
+Use assertion objects in this format:
+
+- `{ "path": "$.available_stock", "equals": 6 }`
+- `{ "path": "$.status", "equals": "released" }`
+- `{ "path": "$[*].reservation_id", "contains": "{{commit_reservation_id}}" }`
+
 ## Required Verification
 
 Generated backend tests must create random SKUs and reservation IDs through the API, then prove:
