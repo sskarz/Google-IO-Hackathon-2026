@@ -21,7 +21,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from db import get_all_tasks
 from main import run_full_flow
-
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 BACKEND_ROOT = Path(__file__).parent
@@ -276,7 +275,7 @@ flow_task: asyncio.Task | None = None
 
 
 async def generate_markdown(transcript: str) -> str:
-    config = LocalAgentConfig(system_instructions=SYSTEM_PROMPT)
+    config = LocalAgentConfig(system_instructions=DESIGN_WRITER_PROMPT)
     async with Agent(config) as agent:
         response = await agent.chat(transcript)
         return await response.text()
