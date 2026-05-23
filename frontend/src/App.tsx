@@ -1,121 +1,159 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
+import { useMemo, useState } from 'react'
+import {
+  useSpeechRecognition,
+  type RecognitionMode,
+} from './hooks/useSpeechRecognition'
 import './App.css'
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [mode, setMode] = useState<RecognitionMode>('push-to-talk')
+  const {
+    isSupported,
+    isListening,
+    finalTranscript,
+    interimTranscript,
+    error,
+    start,
+    stop,
+    reset,
+  } = useSpeechRecognition({ mode })
+
+  const fullTranscript = useMemo(() => {
+    const f = finalTranscript.trim()
+    const i = interimTranscript.trim()
+    if (f && i) return `${f} ${i}`
+    return f || i
+  }, [finalTranscript, interimTranscript])
+
+  const handleToggle = () => {
+    if (isListening) stop()
+    else start()
+  }
+
+  const handleCopy = async () => {
+    if (!fullTranscript) return
+    try {
+      await navigator.clipboard.writeText(fullTranscript)
+    } catch {
+      /* clipboard may be unavailable; silent */
+    }
+  }
+
+  const statusLabel = (() => {
+    if (!isSupported) return 'Browser not supported'
+    if (error) return `Error: ${error}`
+    if (isListening) return mode === 'continuous' ? 'Listening continuously…' : 'Recording…'
+    return mode === 'continuous' ? 'Tap to start streaming' : 'Tap and hold the floor — click again to stop'
+  })()
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
+    <main className="stt-shell">
+      <header className="stt-header">
+        <p className="eyebrow">Step 1 / Pipeline</p>
+        <h1>Describe the system you want to design</h1>
+        <p className="lede">
+          Speak naturally. We&rsquo;ll transcribe locally in your browser, then
+          hand the text off to the LLM for spec generation, diagrams, and red-team review.
+        </p>
+      </header>
+
+      <section className="capture-card" aria-label="Voice capture">
+        <div className="mode-row" role="radiogroup" aria-label="Recognition mode">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={mode === 'push-to-talk'}
+            className={`mode-pill ${mode === 'push-to-talk' ? 'active' : ''}`}
+            onClick={() => setMode('push-to-talk')}
+            disabled={isListening}
+          >
+            Push-to-talk
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={mode === 'continuous'}
+            className={`mode-pill ${mode === 'continuous' ? 'active' : ''}`}
+            onClick={() => setMode('continuous')}
+            disabled={isListening}
+          >
+            Continuous
+          </button>
         </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
+
         <button
           type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
+          className={`record-btn ${isListening ? 'recording' : ''}`}
+          onClick={handleToggle}
+          disabled={!isSupported}
+          aria-pressed={isListening}
+          aria-label={isListening ? 'Stop recording' : 'Start recording'}
         >
-          Count is {count}
+          <span className="record-dot" aria-hidden="true" />
+          <span className="record-label">{isListening ? 'Stop' : 'Record'}</span>
         </button>
+
+        <p className={`status ${error ? 'status-error' : ''}`} aria-live="polite">
+          {statusLabel}
+        </p>
       </section>
 
-      <div className="ticks"></div>
+      <section className="transcript-card" aria-label="Transcript">
+        <div className="transcript-header">
+          <h2>Transcript</h2>
+          <div className="transcript-actions">
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={handleCopy}
+              disabled={!fullTranscript}
+            >
+              Copy
+            </button>
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={reset}
+              disabled={!fullTranscript && !error}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
+        <div className="transcript-body" aria-live="polite">
+          {fullTranscript ? (
+            <p>
+              <span className="final">{finalTranscript}</span>
+              {interimTranscript && (
+                <>
+                  {finalTranscript ? ' ' : ''}
+                  <span className="interim">{interimTranscript}</span>
+                </>
+              )}
+            </p>
+          ) : (
+            <p className="placeholder">
+              Your spoken design will appear here. Try: &ldquo;I want to build a
+              real-time chat app with end-to-end encryption and support for
+              one million concurrent users.&rdquo;
+            </p>
+          )}
         </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
+
+        <footer className="transcript-footer">
+          <span className="char-count">
+            {finalTranscript.length} characters captured
+          </span>
+        </footer>
       </section>
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+      {!isSupported && (
+        <p className="unsupported-note">
+          The Web Speech API isn&rsquo;t available in this browser. Try Chrome, Edge, or Safari.
+        </p>
+      )}
+    </main>
   )
 }
 
