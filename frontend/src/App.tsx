@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from 'react'
 import { AuditorPanel } from './components/AuditorPanel'
 import { DesignViewer } from './components/DesignViewer'
 import { SpecCanvas } from './components/SpecCanvas'
+import { BuildPanel } from './components/BuildPanel'
 import { parseAndValidate } from './spec/validator'
 import type { Spec } from './spec/schema'
 import './App.css'
@@ -11,6 +12,7 @@ function App() {
   const [spec, setSpec] = useState<Spec | null>(null)
   const [specLoading, setSpecLoading] = useState(false)
   const [specError, setSpecError] = useState<string | null>(null)
+  const [designComplete, setDesignComplete] = useState(false)
   // Track the in-flight spec fetch so a section-confirmed event mid-fetch
   // can cancel the stale request and replace it with one that sees the
   // newly-appended DESIGN.md content.
@@ -69,6 +71,7 @@ function App() {
   // Fires once when the full design is finalized.
   const handleDesignSaved = useCallback(() => {
     setRefreshKey((k) => k + 1)
+    setDesignComplete(true)
     refreshSpec()
   }, [refreshSpec])
 
@@ -92,6 +95,10 @@ function App() {
           <DesignViewer refreshKey={refreshKey} />
           <SpecCanvas spec={spec} loading={specLoading} error={specError} />
         </div>
+      )}
+
+      {designComplete && (
+        <BuildPanel />
       )}
     </main>
   )
