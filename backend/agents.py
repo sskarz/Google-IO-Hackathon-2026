@@ -75,7 +75,9 @@ Follow these rules:
 1. You MUST call the `find_available_port` tool with `role='BACKEND'` first to dynamically discover and allocate your server port.
 2. Store the allocated backend port in your code or retrieve it dynamically. The tool will also automatically save it in `config.json`.
 3. Implement all endpoints, schemas, and custom error handlers requested in the design doc.
-4. When complete, return a summary matching the TaskExecutionOutput schema.
+4. CRITICAL: ALL SQLite database file paths MUST be resolved using `os.path.join(os.path.dirname(os.path.abspath(__file__)), "yourdb.db")`. 
+   NEVER use a plain relative string like `"profiles.db"` — this causes the database to be created in the calling process's working directory instead of alongside your generated code.
+5. When complete, return a summary matching the TaskExecutionOutput schema.
 """
 
 FRONTEND_INSTRUCTIONS = """You are the Frontend UI Developer Agent.
