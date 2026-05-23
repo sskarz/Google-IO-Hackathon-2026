@@ -1,116 +1,131 @@
 # Overview
-The system enables users to safely register and log in to a web-based dashboard application. It provides a secure, lightweight, and scalable authentication backend using FastAPI, SQLite/PostgreSQL, and JSON Web Tokens (JWT). The infrastructure is designed to be fully modular, allowing for independent scaling of authentication and dashboard services.
+The proposed system is a secure, lightweight web application that allows users to create accounts (register) and authenticate (log in) securely. User credentials and profile information will be persisted in a database using industry-standard encryption practices to ensure data-at-rest and data-in-transit security. 
+
+To address the user's request for a "simple website" while adhering to cybersecurity best practices, the application will use a decoupled Client-Server architecture with a secured relational database backend.
 
 ## Goals
-- **Secure User Registration:** Allow new users to create accounts with email and password, ensuring password hashing using Argon2/bcrypt.
-- **Stateless Authentication:** Verify user identity via secure, short-lived JWT access tokens and longer-lived, HttpOnly refresh tokens.
-- **Dashboard Access Control:** Restrict dashboard endpoints to authenticated or authorized users only.
-- **Concrete Technical Defaults:** Use FastAPI, SQLite (for development) transitioning to PostgreSQL, and SQLAlchemy ORM for database representation.
-- **Developer-Friendly API Documentation:** Automatically expose interactive Swagger UI and ReDoc endpoints.
+### Functional Goals
+* **Account Creation (Registration)**: Users can register unique accounts with a username, valid email, and secure password.
+* **Authentication (Login)**: Users can securely log in using their credentials to establish an active session.
+* **Session Management**: Authenticated users receive a secure session token (JWT) allowing access to protected space on the site.
+
+### Non-Functional Goals
+* **Password Security**: Passwords must never be stored in plaintext. They will be hashed using a modern, computation-intensive key derivation function (Argon2id or bcrypt) with random salts.
+* **Database Encryption**: The database will be encrypted at rest (AES-256) to ensure data confidentiality in the event of hardware or storage volume compromise.
+* **Network Security**: All communication between the client and backend service must be encrypted in transit using TLS v1.3 (HTTPS).
+* **Simplicity and Maintainability**: Keep the backend lightweight (FastAPI/Python) and the frontend straightforward (HTML5/styled-CSS/JS SPA or React) for ease of development.
 
 ## Architecture
-The system adopts an API-first monolithic architectural style (highly modular) designed for fast, modern deployments:
-1. **Frontend Client:** Web dashboard (React/Vue/HTML5) that interacts with APIs via secure HTTPS.
-2. **API Gateway / Router (FastAPI):** Orchestrates routing, middleware (CORS, Rate Limiting), and dependency injection.
-3. **Authentication Layer:** Deals with credentials verification, password hashing, and token signing/validation.
-4. **Data Access Layer:** Uses SQLAlchemy ORM to communicate with the SQLite/PostgreSQL Database.
-5. **Database Layer:** Holds the relational data model for users, sessions, and dashboard resources.
+This system utilizes a classic layered multi-tier architecture consisting of:
+1. **Presentation Layer (Frontend)**: A single-page web client built with HTML5, CSS3, and JavaScript running inside the user's browser.
+2. **Application Layer (API Backend)**: A modular FastAPI service acting as the backend engine. It processes requests, manages authentication logic, hashes passwords, and speaks to the persistence tier.
+3. **Data Tier (Database)**: A PostgreSQL cluster with Transparent Data Encryption (TDE) or full-disk AES-256 volume encryption enabled.
 
 ```mermaid
 graph TD
-    User([User / Web Browser]) -->|HTTPS Request| FE[Frontend Client / Dashboard UI]
-    FE -->|API Call: JWT in Authorization Header| API[FastAPI Backend Server]
-    API -->|1. Route & Middleware| Cors[CORS / Rate Limiting Middleware]
-    API -->|2. Process Auth/Data Requests| Controllers[Auth & User Controllers]
-    Controllers -->|Authenticate / Verify Token| JWT[JWT Token Utility]
-    Controllers -->|Query / Mutate| ORM[SQLAlchemy ORM]
-    ORM -->|Read/Write Model| DB[(SQLite / PostgreSQL Database)]
+    Client["Web Browser
+    (HTML5/JS SPA via HTTPS)"]
+    
+    subgraph backend_boundary["Backend Environment (TLS Edge)"]
+        API["FastAPI API Server
+        (Uvicorn / Python 3.12)"]
+        AuthEngine["Cryptographic Core
+        (Argon2id Hashing & JWT)"]
+    end
+    
+    subgraph database_boundary["Database Tier (Encrypted Volume)"]
+        DB[("PostgreSQL Database
+        (AES-256 Encrypted at Rest)")]
+    end
+    
+    Client -- "HTTPS (TLS 1.3)" --> API
+    API <--> AuthEngine
+    API -- "Encrypted SQL Conn (SSL Mode)" --> DB
 ```
 
 ## Components
-The infrastructure comprises the following Core Components:
+### 1. Presentation Tier (Web Frontend)
+* **Register Screen**: Captures Username, Email, Password, and Password Confirmation. Implements client-side length, complexity, and uniformity policies prior to submission.
+* **Login Screen**: Captures Username/Email and Password. Safely handles and clears memory of input buffers.
+* **Dashboard (Protected Area)**: A simple landing space displayed to authenticated users, displaying their status.
+* **Client Auth Handler**: Manages the storage of temporary JWTs within secure memory (or HttpOnly, SameSite Session Cookies) to safeguard sessions against Cross-Site Scripting (XSS).
 
-1. **User Manager & AuthService:**
-   - **Responsibility:** Password hashing (using `passlib` with `bcrypt` backend), access/refresh token generation, and user validation logic.
-   - **Core API endpoints:**
-     - `POST /api/v1/auth/register` (Payload: `UserCreate` schema)
-     - `POST /api/v1/auth/login` (Payload: `OAuth2PasswordRequestForm`)
-     - `POST /api/v1/auth/refresh` (Payload: Refresh token)
+### 2. Application Tier (FastAPI Backend)
+* **Registration Controller**: Endpoint `POST /api/register` processes incoming sign-ups. Rejects weak passwords and handles username-uniqueness validation.
+* **Login Controller**: Endpoint `POST /api/login` verifies user-submitted credentials and issues an ephemeral JSON Web Token (JWT).
+* **Cryptographic Core**:
+  * **Hasher Component**: Leverages the `argon2-cffi` or `bcrypt` library to process incoming plaintext passwords with randomly generated salts.
+  * **Token Generator**: Generates cryptographically signed JWT tokens with a localized expiration period (e.g., 30 minutes). Uses an HMAC with SHA-256 signature using a secure key from backend environment variables.
+* **Database Access Abstraction**: SQL Alchemy or SQLModel connection engine configured to use strict SSL connection parameters for querying PostgreSQL.
 
-2. **Dashboard Controller & User Routes:**
-   - **Responsibility:** Fetching user-specific dashboard insights and editing profile settings.
-   - **Core API endpoints:**
-     - `GET /api/v1/users/me` (Protected: Requires valid Bearer Token)
-     - `GET /api/v1/dashboard/stats` (Protected: Dashboard data tailored to the logged-in user)
-
-3. **Database Model (`User` Entity):**
-   - **Columns:**
-     - `id`: `UUID` (Primary Key, uniquely identifies the user)
-     - `email`: `String(255)` (Unique, Indexed, used as login identifier)
-     - `hashed_password`: `String` (Securely encrypted password hash)
-     - `is_active`: `Boolean` (Flags deactivated accounts)
-     - `created_at`: `DateTime` (Timestamp of creation)
-     - `updated_at`: `DateTime` (Timestamp of last update)
-
-4. **Dependency Injection & Security Rules:**
-   - `get_db`: Yields database sessions.
-   - `get_current_user`: Dependency that extracts, decodes, and validates the JWT Bearer-Token, fetching the user dynamically.
+### 3. Storage Tier (Database)
+* **Database Choice**: PostgreSQL or SQLite with SQLCipher extension (for localized/offline setups).
+* **Database Security**: Complete disk volume encryption (AES-256) or Postgres Transparent Data Encryption (TDE).
+* **Users Schema Table (`users`)**:
+  | Column Name | Data Type | Constraints | Description |
+  | :--- | :--- | :--- | :--- |
+  | `id` | `UUID` | PRIMARY KEY, Default: uuid_generate_v4() | Unique internal identifier. |
+  | `username` | `VARCHAR(50)` | UNIQUE, NOT NULL | Publicly visible registration name. |
+  | `email` | `VARCHAR(255)` | UNIQUE, NOT NULL | User's unique email. |
+  | `password_hash` | `VARCHAR(255)` | NOT NULL | Salted Argon2id or bcrypt hash of the password. |
+  | `created_at` | `TIMESTAMP` | NOT NULL, Default: NOW() | Audit timestamp metadata. |
+  | `last_login` | `TIMESTAMP` | NULL | Monitoring access metrics. |
 
 ## Data Flow
+### A. User Registration Flow
+1. **Input Submission**: The user enters their information and clicks "Sign Up".
+2. **Payload Transmission**: The client app validates metrics and sends a `POST /api/register` request containing JSON payloads (plain password) over a secure HTTPS/TLS tunnel.
+3. **Existence Check**: The API backend queries the database for whether the `username` or `email` already exists to prevent duplicate credentials.
+4. **Password Hashing**: If unique, the Cryptographic Core generates a secure salt and passes the password through the Argon2id key derivation function to generate a secure `password_hash`.
+5. **Data Persistence**: The backend issues an `INSERT` statement to the DB, appending the username, email, and hashed credentials into the encrypted storage volume.
+6. **Response**: A `201 Created` status is returned to the client, notifying them to redirect to the login page.
 
-### User Registration Flow
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as Client Browser
-    participant API as FastAPI Router
-    participant DB as SQLite / PostgreSQL Database
+    actor User as Web Browser
+    participant API as FastAPI Backend
+    participant Crypto as Hasher Core
+    participant DB as Encrypted PostgreSQL
     
-    User->>API: POST /api/v1/auth/register (email, password)
-    API->>API: Validate input schemas (Pydantic Validation)
-    API->>DB: Check if email already exists
-    alt Email exists
-        DB-->>API: User Record Found
-        API-->>User: HTTP 400 Bad Request (Email already registered)
-    else Email is unique
-        API->>API: Hash password via Bcrypt/Argon2
-        API->>DB: Insert new user (email, hashed_password)
-        DB-->>API: Return User model
-        API-->>User: HTTP 201 Created (user_id, email, is_active)
-    end
+    User->>API: POST /api/register (Username, Email, Password) via TLS
+    API->>DB: Check if Username or Email is Taken
+    DB-->>API: Conflict Check Result (False)
+    API->>Crypto: Hash Password (Argon2id)
+    Crypto-->>API: password_hash
+    API->>DB: INSERT INTO users (username, email, password_hash)
+    Note over DB: Data automatically encrypted<br/>at storage layer (AES-256)
+    DB-->>API: Return User ID
+    API-->>User: HTTP 201 Created Status
 ```
 
-### User Login & Dashboard Access Flow
+### B. User Authentication Flow
+1. **Input Submission**: The user enters their Username/Email and password on the Login form.
+2. **Credential Transmission**: Submitted passwords flow over HTTPS to the backend controller `POST /api/login`.
+3. **Lookup**: The backend retrieves the matching record from the `users` table based on the identifier provided.
+4. **Verification**: The retrieved `password_hash` and the newly submitted plaintext password are fed into the Cryptographic verification function.
+5. **Token Generation**: If the passwords match, the backend generates an access JWT signed with the backend's `JWT_SECRET` key.
+6. **Authorization Response**: The token is sent back to the client as an Authorization payload (or stored in an HttpOnly cookie) for subsequent API requests.
+
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as Client Browser
-    participant API as FastAPI Router
-    participant DB as SQLite/PostgreSQL DB
+    actor User as Web Browser
+    participant API as FastAPI Backend
+    participant Crypto as Hasher Core
+    participant DB as Encrypted PostgreSQL
     
-    User->>API: POST /api/v1/auth/login (email, password)
-    API->>DB: Retrieve User record by email
-    alt User not found
-        DB-->>API: Null
-        API-->>User: HTTP 401 Unauthorized (Invalid credentials)
-    else User exists
-        API->>API: Compare raw password against hashed_password
-        alt Password matches
-            API->>API: Generate Access JWT (expires in 15m) & Refresh JWT
-            API-->>User: HTTP 200 OK (access_token, token_type, refresh_token)
-        else Password mismatch
-            API-->>User: HTTP 401 Unauthorized (Invalid credentials)
-        end
-    end
-    
-    Note over User, API: Accessing Restricted Dashboard
-    User->>API: GET /api/v1/dashboard/stats with Bearer [Access Token]
-    API->>API: Decode and verify JWT Signature & Expiry
-    alt JWT Token invalid or expired
-        API-->>User: HTTP 401 Unauthorized (Could not validate credentials)
-    else JWT Token is valid
-        API->>DB: Fetch specific user dashboard insights
-        DB-->>API: Return DB stats
-        API-->>User: HTTP 200 OK (Dashboard JSON data payload)
-    end
+    User->>API: POST /api/login (Username, Password) via TLS
+    API->>DB: SELECT * FROM users WHERE username = 'input_username'
+    DB-->>API: Match found: [id, password_hash]
+    API->>Crypto: Verify password against password_hash
+    Crypto-->>API: Match validated (True)
+    API->>API: Generate Access JWT (Signed with SECRET_KEY)
+    API-->>User: HTTP 200 OK + JWT (Response payload / Secure cookie)
 ```
+
+## Open Questions
+* **Level of Database Encryption**: Does "encrypted database" mean encryption-at-rest (the underlying server disk storage volume is encrypted with AES-256 via the infrastructure/cloud provider)? Or is client-side/application-layer column or envelope encryption required (where sensitive credentials are additionally encrypted before we invoke SQL queries)?
+* **Session Strategy**: Should sessions be managed via JSON Web Tokens (JWT) kept in browser session storage, or should they use more secure Stateful HttpOnly Cookies with the `SameSite=Strict` flag to mitigate Cross-Site Scripting (XSS)?
+* **Requirements for Password Reset**: Is a password recovery flow required (e.g., SMTP integrations to send reset tokens, or security questions), or is self-service password recovery out of scope for the MVP?
+* **Hosting Environment**: Is this simple website meant to serve locally on a developer’s machine (e.g., using Docker Compose with SQLite/Postgres), or is there a specific cloud destination targets (e.g., AWS RDS with KMS encryption, Google Cloud SQL with customer-managed keys)?

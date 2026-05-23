@@ -408,3 +408,123 @@
   code { font-family: monospace; font-size: 13px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
   pre  { background: var(--code-bg); padding: 16px; border-radius: 8px; overflow-x: auto; margin: 0 0 12px; }
 }
+
+.output-panels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  align-items: start;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.spec-canvas {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: #0a0a0a;
+  overflow: hidden;
+}
+
+.spec-canvas-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--bg);
+
+  h2 {
+    margin: 0;
+    font-size: 18px;
+    font-family: monospace;
+  }
+}
+
+.spec-canvas-meta {
+  font-size: 12px;
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+.spec-canvas-container {
+  position: relative;
+  width: 100%;
+  height: 640px;
+  background: #0a0a0a;
+  overflow: hidden;
+}
+
+.spec-canvas-state {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  color: #71717a;
+  font-size: 14px;
+  font-style: italic;
+  pointer-events: none;
+
+  &.error {
+    color: #f87171;
+  }
+}
+
+.viz-label {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  color: #e4e4e7;
+  user-select: none;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.95);
+}
+
+.viz-label-node {
+  font-size: 13px;
+  text-align: center;
+  white-space: nowrap;
+  background: rgba(10, 10, 10, 0.82);
+  padding: 4px 9px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.viz-label-title {
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.viz-label-subtype {
+  font-size: 10px;
+  color: #a1a1aa;
+  margin-top: 1px;
+  font-family: var(--mono);
+  letter-spacing: 0.3px;
+}
+
+.viz-label-edge {
+  font-size: 12px;
+  background: rgba(10, 10, 10, 0.78);
+  color: #d4d4d8;
+  padding: 2px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.viz-label-group {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: #c4b5fd;
+  background: rgba(99, 102, 241, 0.15);
+  padding: 3px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}

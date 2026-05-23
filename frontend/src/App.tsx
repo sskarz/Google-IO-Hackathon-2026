@@ -5,6 +5,9 @@ import {
 } from './hooks/useSpeechRecognition'
 import { DesignViewer } from './components/DesignViewer'
 import { AuditViewer } from './components/AuditViewer'
+import { SpecCanvas } from './components/SpecCanvas'
+import { parseAndValidate } from './spec/validator'
+import type { Spec } from './spec/schema'
 import './App.css'
 
 type GenerateStatus = 'idle' | 'submitting' | 'success' | 'error'
@@ -33,10 +36,18 @@ function App() {
   const [generateError, setGenerateError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
 
+  const [spec, setSpec] = useState<Spec | null>(null)
+  const [specLoading, setSpecLoading] = useState(false)
+  const [specError, setSpecError] = useState<string | null>(null)
+
   const handleGenerate = useCallback(async (transcript: string) => {
     if (!transcript.trim()) return
     setGenerateStatus('submitting')
     setGenerateError(null)
+    setSpec(null)
+    setSpecError(null)
+    setSpecLoading(true)
+
     try {
       const res = await fetch('http://localhost:8000/generate-design', {
         method: 'POST',
@@ -47,11 +58,41 @@ function App() {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail ?? `HTTP ${res.status}`)
       }
-      setGenerateStatus('success')
-      setRefreshKey((k) => k + 1)
     } catch (e) {
       setGenerateError(e instanceof Error ? e.message : 'Unknown error')
       setGenerateStatus('error')
+      setSpecLoading(false)
+      return
+    }
+    setGenerateStatus('success')
+    setRefreshKey((k) => k + 1)
+
+    try {
+      const specRes = await fetch('http://localhost:8000/generate-spec', {
+        method: 'POST',
+      })
+      if (!specRes.ok) {
+        const data = await specRes.json().catch(() => ({}))
+        const detail =
+          typeof data.detail === 'string'
+            ? data.detail
+            : JSON.stringify(data.detail ?? data)
+        throw new Error(detail || `HTTP ${specRes.status}`)
+      }
+      const specJson: unknown = await specRes.json()
+      const parsed = parseAndValidate(specJson)
+      if (!parsed.ok) {
+        const summary = parsed.issues
+          .slice(0, 5)
+          .map((i) => `${i.path}: ${i.message}`)
+          .join('; ')
+        throw new Error(`Invalid spec from backend: ${summary}`)
+      }
+      setSpec(parsed.spec)
+    } catch (e) {
+      setSpecError(e instanceof Error ? e.message : 'Unknown error')
+    } finally {
+      setSpecLoading(false)
     }
   }, [])
 
@@ -200,7 +241,10 @@ function App() {
         </footer>
       </section>
 
-      <DesignViewer refreshKey={refreshKey} />
+      <div className="output-panels">
+        <DesignViewer refreshKey={refreshKey} />
+        <SpecCanvas spec={spec} loading={specLoading} error={specError} />
+      </div>
       <AuditViewer refreshKey={refreshKey} />
 
       {!isSupported && (
