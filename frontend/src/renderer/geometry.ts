@@ -56,10 +56,17 @@ function buildMaterial(shape: ShapeKind, color: number): THREE.Material {
       color,
       wireframe: true,
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.9,
     })
   }
-  return new THREE.MeshLambertMaterial({ color })
+  // Emissive at 40% of base color lets the shape self-illuminate enough to
+  // read against the near-black scene background, while the directional
+  // light still adds enough Lambert shading to keep the form 3D.
+  return new THREE.MeshLambertMaterial({
+    color,
+    emissive: color,
+    emissiveIntensity: 0.4,
+  })
 }
 
 function orientCapsule(mesh: THREE.Mesh, shape: ShapeKind) {

@@ -11,6 +11,7 @@ const SECTIONS_ORDER = ['goals', 'architecture', 'components', 'data_flow']
 
 interface Props {
   onDesignSaved: () => void
+  onSectionConfirmed?: (nextSection: string | null) => void
 }
 
 function formatElapsed(ms: number): string {
@@ -20,7 +21,7 @@ function formatElapsed(ms: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
-export function AuditorPanel({ onDesignSaved }: Props) {
+export function AuditorPanel({ onDesignSaved, onSectionConfirmed }: Props) {
   const {
     connected,
     speaking,
@@ -34,7 +35,7 @@ export function AuditorPanel({ onDesignSaved }: Props) {
     sendDone,
     reset,
     toggleMute,
-  } = useLiveAudio(onDesignSaved)
+  } = useLiveAudio(onDesignSaved, onSectionConfirmed)
 
   const didConnectRef = useRef(false)
   useEffect(() => {
@@ -48,7 +49,9 @@ export function AuditorPanel({ onDesignSaved }: Props) {
   const total = SECTIONS_ORDER.length
   const pct = Math.round((completed / total) * 100)
 
-  const orbState = speaking
+  const orbState = designSaved
+    ? 'complete'
+    : speaking
     ? 'speaking'
     : !connected
     ? 'loading'
@@ -58,10 +61,10 @@ export function AuditorPanel({ onDesignSaved }: Props) {
 
   const statusText = !connected
     ? 'Connecting…'
+    : designSaved
+    ? "✓ Design complete — you're good to go"
     : speaking
     ? 'Speaking…'
-    : designSaved
-    ? 'Design complete'
     : muted
     ? 'Mic off — press Start to talk'
     : `Discussing: ${SECTION_LABELS[currentSection ?? 'goals'] ?? currentSection}`
@@ -94,7 +97,9 @@ export function AuditorPanel({ onDesignSaved }: Props) {
 
       <div className="auditor-status-area">
         <div className={`auditor-orb ${orbState}`} />
-        <p className="auditor-status-text">{statusText}</p>
+        <p className={`auditor-status-text ${designSaved ? 'complete' : ''}`}>
+          {statusText}
+        </p>
       </div>
 
       <div className="auditor-controls">

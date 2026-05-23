@@ -1,4 +1,4 @@
-import type { EdgeKind, NodeType } from '../spec/schema'
+import type { EdgeKind, GroupType, NodeType } from '../spec/schema'
 
 export type ShapeKind =
   | 'box'
@@ -55,8 +55,34 @@ export const EDGE_VISUALS: Record<EdgeKind, EdgeVisual> = {
   data_flow: { color: 0x6ee7b7, dashed: true, dashSize: 0.1, gapSize: 0.2, doubleStroke: false },
 }
 
+export interface GroupVisual {
+  fillColor: number
+  borderColor: number
+}
+
+// Distinct per-type palette so adjacent groups read as different boundaries.
+export const GROUP_VISUALS: Record<GroupType, GroupVisual> = {
+  vpc: { fillColor: 0x6366f1, borderColor: 0x818cf8 },      // indigo
+  region: { fillColor: 0x0ea5e9, borderColor: 0x38bdf8 },   // sky
+  az: { fillColor: 0x14b8a6, borderColor: 0x2dd4bf },       // teal
+  cluster: { fillColor: 0xec4899, borderColor: 0xf472b6 },  // pink
+  boundary: { fillColor: 0x64748b, borderColor: 0x94a3b8 }, // slate
+}
+
+// Derived constants for label Y placement. NODE_LABEL_Y sits a hair above the
+// tallest possible node mesh so every label has a consistent screen Y baseline.
+// GROUP_LABEL_Y sits well above that so group captions float clear of any node.
+export const MAX_MESH_HEIGHT = Math.max(
+  ...Object.values(NODE_VISUALS).map((v) => v.meshHeight)
+)
+export const NODE_LABEL_Y = MAX_MESH_HEIGHT + 0.6
+export const GROUP_LABEL_Y = MAX_MESH_HEIGHT + 1.6
+
 export const GROUND_Y = 0
 export const EDGE_Y = 0.08
 export const SHADOW_Y = 0.005
 export const SCENE_BG = 0x0a0a0a
 export const GROUND_COLOR = 0x111114
+
+export const GROUP_FILL_OPACITY = 0.13
+export const GROUP_BORDER_OPACITY = 0.8

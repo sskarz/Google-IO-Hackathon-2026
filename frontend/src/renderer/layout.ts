@@ -89,13 +89,22 @@ export async function layoutSpec(spec: Spec): Promise<LaidOut> {
     layoutOptions: {
       'elk.algorithm': 'layered',
       'elk.direction': 'RIGHT',
-      'elk.spacing.nodeNode': '4.5',
-      'elk.layered.spacing.nodeNodeBetweenLayers': '6.0',
-      'elk.spacing.edgeNode': '2.0',
-      'elk.spacing.edgeEdge': '1.0',
-      'elk.padding': '[top=1.5, left=1.5, right=1.5, bottom=1.5]',
+      'elk.spacing.nodeNode': '7.0',
+      'elk.layered.spacing.nodeNodeBetweenLayers': '9.0',
+      'elk.spacing.edgeNode': '3.5',
+      // Wide gap between parallel edge tracks so fan-outs (one node →
+      // many siblings) don't tangle.
+      'elk.spacing.edgeEdge': '4.0',
+      'elk.padding': '[top=2.0, left=2.0, right=2.0, bottom=2.0]',
       'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
-      'elk.edgeRouting': 'ORTHOGONAL',
+      // SPLINES gives smooth curves that separate naturally in fan-outs;
+      // ORTHOGONAL stacks parallel L-shaped tracks that overlap when many
+      // edges share a source or sink.
+      'elk.edgeRouting': 'SPLINES',
+      // Spend more time minimizing crossings + finding clean routes. 10 is
+      // ELK's high-quality default for layered.
+      'elk.layered.thoroughness': '10',
+      'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
     },
     children: rootChildren,
     edges: elkEdges,

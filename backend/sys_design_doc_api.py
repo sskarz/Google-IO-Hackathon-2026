@@ -459,8 +459,11 @@ async def generate_spec():
     if not markdown.strip():
         raise HTTPException(status_code=400, detail="DESIGN.md is empty.")
 
+    # Run the blocking Gemini call in a thread so the asyncio event loop stays
+    # free to service the auditor WebSocket (audio in/out + tool calls). Without
+    # this, generate-spec freezes the conversation for the duration of the call.
     try:
-        spec = call_gemini_for_spec(markdown, api_key)
+        spec = await asyncio.to_thread(call_gemini_for_spec, markdown, api_key)
     except HTTPException:
         raise
     except Exception as e:
@@ -475,7 +478,7 @@ async def generate_spec():
             + "\nProduce a corrected spec."
         )
         try:
-            spec = call_gemini_for_spec(retry_prompt, api_key)
+            spec = await asyncio.to_thread(call_gemini_for_spec, retry_prompt, api_key)
         except HTTPException:
             raise
         except Exception as e:
@@ -495,20 +498,80 @@ async def generate_spec():
 LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
 LIVE_SYSTEM_PROMPT = """\
-You are a senior software architect conducting a friendly voice conversation to build a system design document.
+You are a senior software architect conducting a voice interview that builds AND
+hardens a system design document. You are constructive in the discuss phase and
+ADVERSARIAL in the red-team phase. Speak naturally — responses are played as
+audio. Keep each turn to 1–2 short sentences. Ask ONE question per turn — never
+chain multiple questions together.
 
-Work through these four sections IN ORDER. Only move to the next section after the current one is confirmed.
-  1. goals        — what the system does, the problem it solves, key goals and non-goals
-  2. architecture — high-level approach (monolith/microservices, sync/async, key patterns)
+Work through these four sections IN ORDER. Only move to the next section after
+the current one is confirmed AND hardened:
+  1. goals        — what the system does, key goals and non-goals
+  2. architecture — high-level approach (monolith/microservices, sync/async)
   3. components   — individual services/components and their responsibilities
   4. data_flow    — how data and requests move through the system
 
-Rules:
-- Speak naturally — responses will be played as audio. Keep them to 2–3 sentences max.
-- Ask 1–2 focused questions per turn to understand the current section.
-- When you have concrete, specific detail for a section — not vague generalities — call confirm_section.
-- After confirming each section, briefly acknowledge it and introduce the next topic naturally.
-- When all four sections are confirmed, call finalize_design with the complete markdown document.
+For each section, follow this 5-phase loop strictly:
+
+Phase 1 — DISCUSS:
+- Ask ONE focused question per turn. Never chain ("X and also Y?"). One question.
+- DO NOT confirm prematurely. You must NOT call confirm_section until you have at
+  least this much coverage:
+    goals:        2+ specific goals the user named, plus any non-goals they mentioned
+    architecture: the monolith/services decision PLUS at least one key pattern
+                  (sync vs async, caching strategy, sharding, etc.)
+    components:   3+ named components with their responsibilities, OR the user has
+                  explicitly said the list is complete
+    data_flow:    at least one COMPLETE end-to-end flow described step by step
+- If you don't have that yet, ask the NEXT question instead of confirming.
+- After each user turn, ask yourself: "Did the user actually answer my question
+  with concrete detail, or did they wave at it?" If they waved, dig in further
+  before moving on. Resist the urge to confirm early just to reach the red-team phase.
+
+Phase 2 — CONFIRM:
+- Re-read every user turn for this section in your head before composing section_content.
+- The section_content MUST include EVERY specific detail the user has stated for this
+  section. Do not drop, paraphrase away, or condense out goals, components, or flows
+  the user named. If the user said "five services: orders, inventory, payments,
+  shipping, notifications", all five must appear in section_content.
+- Call confirm_section with the complete markdown for that section.
+- In your spoken reply, briefly acknowledge it ("Got it — orders service writes to
+  Postgres, kafka for events…").
+
+Phase 3 — RED-TEAM (exactly ONE sharp critique, specific to the section just confirmed):
+- Immediately after confirm_section, raise the SINGLE most important weakness for
+  that section's domain. Phrase it as a concrete, pointed question.
+- Pick from the section's risk surface:
+    goals:        ambiguity, conflicting goals, missing non-goals, scope creep
+    architecture: failure modes, scaling cliffs, coordination overhead, tech mismatch
+    components:   single points of failure, missing infra (auth, monitoring), ownership
+    data_flow:    race conditions, consistency gaps, security (auth/encryption), exactly-once
+- Examples of good red-team prompts:
+    "What happens to in-flight orders when the Postgres primary dies?"
+    "If traffic spikes 10x overnight, where does this architecture break first?"
+    "How do you stop a malicious client from replaying the same purchase event?"
+- ONE critique only. Be sharp, not exhaustive.
+
+Phase 4 — HARDEN:
+- Listen to the user's answer.
+- If the answer materially changes the section (adds a component, changes a flow,
+  introduces a mitigation), call confirm_section AGAIN with the UPDATED content for
+  the same section_key. Re-confirming overwrites the previous content — that is
+  intentional. The diagram updates to reflect the hardened design.
+- If the user just clarifies without changing substance, accept the answer and
+  do NOT re-call confirm_section.
+
+Phase 5 — TRANSITION:
+- Only after the red-team round, move to the next section with a natural handoff
+  ("Alright, that covers components. Let's talk about data flow — …").
+
+When all four sections are confirmed AND hardened, call finalize_design with
+the complete integrated markdown document.
+
+CRITICAL — Final wrap-up message:
+- The spoken response that accompanies finalize_design MUST clearly say, near the end:
+    "Your system design is ready. You're good to go."
+- This is the user's signal that the conversation is complete. Do not skip it.
 
 Section content format for confirm_section (include the ## heading):
   goals:        "## Goals\n- <goal bullets>\n\n### Non-Goals\n- <if mentioned>"
@@ -564,7 +627,11 @@ async def _handle_live_tool(name: str, args: dict, websocket: WebSocket) -> str:
     if name == "confirm_section":
         key = args.get("section_key", "")
         content = args.get("section_content", "")
-        if key in DESIGN_SECTIONS and key not in _session.sections_confirmed:
+        if key in DESIGN_SECTIONS and content:
+            # Allow re-confirm so the hardened post-red-team content overwrites
+            # the first confirm. The frontend will refetch the spec and the
+            # diagram updates to reflect the harder design.
+            was_update = key in _session.sections_confirmed
             _session.sections_confirmed[key] = content
             _write_sections_to_design()
             remaining = [s for s in DESIGN_SECTIONS if s not in _session.sections_confirmed]
@@ -573,6 +640,7 @@ async def _handle_live_tool(name: str, args: dict, websocket: WebSocket) -> str:
                 "sections_progress": {s: s in _session.sections_confirmed for s in DESIGN_SECTIONS},
                 "current_section": remaining[0] if remaining else None,
             }))
+            return "updated" if was_update else "saved"
         return "saved"
 
     if name == "finalize_design":
@@ -671,6 +739,19 @@ async def auditor_ws(websocket: WebSocket):
                     logging.error(f"recv_from_browser error: {e}\n{traceback.format_exc()}")
                     stop.set()
 
+            # When finalize_design fires, we don't close the session immediately —
+            # we want Gemini to speak its "you're good to go" wrap-up turn first.
+            # We close once Gemini emits turn_complete after the tool response,
+            # with a safety timer in case the model never produces one.
+            wrap_up_pending = False
+            WRAP_UP_TIMEOUT = 15.0
+
+            async def _safety_close_after_wrap_up():
+                await asyncio.sleep(WRAP_UP_TIMEOUT)
+                if wrap_up_pending and not stop.is_set():
+                    logging.warning("wrap-up safety timeout reached; closing session")
+                    stop.set()
+
             async def recv_from_gemini():
                 """
                 Wraps session.receive() in an outer while loop. The SDK's receive()
@@ -678,6 +759,7 @@ async def auditor_ws(websocket: WebSocket):
                 we re-enter and call receive() again. Only an actual exception
                 (ConnectionClosedError) means the session truly ended.
                 """
+                nonlocal wrap_up_pending
                 try:
                     logging.info("recv_from_gemini: started")
                     while not stop.is_set():
@@ -695,6 +777,11 @@ async def auditor_ws(websocket: WebSocket):
 
                             sc = getattr(msg, "server_content", None)
                             if sc and getattr(sc, "turn_complete", False):
+                                if wrap_up_pending:
+                                    # Gemini just finished speaking the wrap-up. Close.
+                                    logging.info("wrap-up turn_complete received, closing session")
+                                    stop.set()
+                                    return
                                 logging.info("turn_complete received (session stays open)")
 
                             if hasattr(msg, "data") and msg.data:
@@ -716,11 +803,14 @@ async def auditor_ws(websocket: WebSocket):
                                     ))
                                 if responses:
                                     await session.send_tool_response(function_responses=responses)
-                                # Design finalized — stop everything
-                                if _session.design_saved:
-                                    logging.info("design saved, closing session")
-                                    stop.set()
-                                    return
+                                # Design finalized — keep the session alive so
+                                # Gemini's "you're good to go" wrap-up can stream
+                                # back to the user. The next turn_complete (or
+                                # the safety timer) will close us.
+                                if _session.design_saved and not wrap_up_pending:
+                                    wrap_up_pending = True
+                                    logging.info("design saved, awaiting wrap-up speech")
+                                    asyncio.create_task(_safety_close_after_wrap_up())
                         # Iterator ended. If we got nothing, brief sleep to avoid spin.
                         if not got_any:
                             await asyncio.sleep(0.05)

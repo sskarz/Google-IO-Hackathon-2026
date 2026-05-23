@@ -14,7 +14,10 @@ export interface LiveAudioState {
   error: string | null
 }
 
-export function useLiveAudio(onDesignSaved: () => void) {
+export function useLiveAudio(
+  onDesignSaved: () => void,
+  onSectionConfirmed?: (sectionKey: string | null) => void
+) {
   const [state, setState] = useState<LiveAudioState>({
     connected: false,
     speaking: false,
@@ -171,6 +174,10 @@ export function useLiveAudio(onDesignSaved: () => void) {
               sectionsProgress: msg.sections_progress ?? s.sectionsProgress,
               currentSection: msg.current_section ?? s.currentSection,
             }))
+            // A section just got confirmed and DESIGN.md was rewritten with
+            // the accumulated content. Let the parent refetch the partial
+            // design + regenerate the spec so the 3D scene grows in lockstep.
+            onSectionConfirmed?.(msg.current_section ?? null)
           } else if (msg.type === 'design_saved') {
             setState(s => ({
               ...s,
@@ -190,7 +197,10 @@ export function useLiveAudio(onDesignSaved: () => void) {
             streamRef.current = null
             captureCtxRef.current?.close().catch(() => {})
             captureCtxRef.current = null
-            // Let any in-flight Gemini audio finish playing, then close ws
+            // Keep the WS open long enough for Gemini's "you're good to go"
+            // wrap-up speech to stream through and play. The backend normally
+            // closes the connection itself once Gemini emits turn_complete
+            // after finalize_design; this is a safety net.
             setTimeout(() => {
               wsRef.current?.close()
               wsRef.current = null
@@ -198,7 +208,7 @@ export function useLiveAudio(onDesignSaved: () => void) {
               playCtxRef.current = null
               nextPlayRef.current = 0
               pauseTimer()
-            }, 1500)
+            }, 20000)
           } else if (msg.type === 'error') {
             setState(s => ({ ...s, error: `Live: ${msg.message}` }))
           }
@@ -224,7 +234,7 @@ export function useLiveAudio(onDesignSaved: () => void) {
         if (!designSavedRef.current && !wsRef.current) connect()
       }, 5000)
     }
-  }, [playChunk, onDesignSaved, startTimer, pauseTimer])
+  }, [playChunk, onDesignSaved, onSectionConfirmed, startTimer, pauseTimer])
 
   const disconnect = useCallback(() => {
     wsRef.current?.close()
