@@ -62,7 +62,10 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
         policies = [
             policy.allow(
                 "run_command",
-                when=lambda args: any(cmd in args.get("CommandLine", "") for cmd in ["uvicorn", "npm", "vite", "pytest", "curl", "bun"]),
+                when=lambda args: any(cmd in args.get("CommandLine", "") for cmd in [
+                    "uvicorn", "npm", "vite", "pytest", "curl", "bun",
+                    "nohup", "sleep", "kill", "bash", "sh", "chmod", "cat", "echo"
+                ]),
                 name="allow_e2e_commands"
             )
         ] + policy.confirm_run_command()
