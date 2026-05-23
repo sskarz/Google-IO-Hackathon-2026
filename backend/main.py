@@ -1,6 +1,109 @@
-def main():
-    print("Hello from backend!")
+import argparse
+import asyncio
+import os
+import shutil
+import dotenv
 
+# Load environment variables from the current directory and the parent directory
+dotenv.load_dotenv()
+dotenv.load_dotenv("../.env")
+
+from db import init_db, add_task, DB_PATH
+from dispatcher import run_orchestrator
+
+DEFAULT_DESIGN = """# User Profile Service Design
+
+This microservice handles user profile storage and retrieval.
+
+## Data Schema
+A user profile consists of:
+- `user_id`: unique string identifier (e.g. "user_123")
+- `username`: string, non-empty (e.g. "alice")
+- `email`: valid email string (e.g. "alice@example.com")
+- `created_at`: timestamp string
+
+## API Endpoints
+
+### 1. GET /profile/{user_id}
+- Response Code: 200 OK
+- Response Body: JSON object matching user profile
+- Error Codes: 404 Not Found if user_id doesn't exist
+
+### 2. POST /profile
+- Request Body: JSON object with `user_id`, `username`, `email`
+- Response Code: 201 Created
+- Response Body: JSON object matching user profile
+- Error Codes: 400 Bad Request if missing fields or invalid email
+"""
+
+def prepare_design_doc(path: str) -> str:
+    """Reads the design doc, or creates a default sample if it doesn't exist."""
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(DEFAULT_DESIGN)
+        print(f"Created default system design document at: {path}")
+    
+    with open(path, "r") as f:
+        return f.read()
+
+def main():
+    parser = argparse.ArgumentParser(description="Multi-Agent Kanban Orchestrator MVP")
+    parser.add_argument(
+        "--design", 
+        default="docs/sample_design.md",
+        help="Path to the system design document (markdown)."
+    )
+    parser.add_argument(
+        "--workspace", 
+        default="generated_project",
+        help="Path to the target workspace folder where mocks and tests are generated."
+    )
+    parser.add_argument(
+        "--reset", 
+        action="store_true",
+        help="Reset and wipe existing database and workspace folder before running."
+    )
+    
+    args = parser.parse_args()
+    
+    # 1. Reset if requested
+    if args.reset:
+        print("Resetting database and workspace...")
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        if os.path.exists(args.workspace):
+            shutil.rmtree(args.workspace)
+            
+    # Ensure workspace exists
+    os.makedirs(args.workspace, exist_ok=True)
+    
+    # 2. Initialize DB
+    init_db()
+    print("Kanban database initialized.")
+    
+    # 3. Read/prepare design document
+    design_content = prepare_design_doc(args.design)
+    
+    # 4. Seed the initial Architect task to decompose the design
+    add_task(
+        task_id="task_architect_decomposer",
+        title="Decompose System Design",
+        description=(
+            f"Read the system design document content provided in the input context. "
+            f"Identify the endpoints, requirements, schemas, and decompose them into: "
+            f"1) MOCKER task to implement stubs/mocks. "
+            f"2) TESTER task to implement automated tests matching the stubs. "
+            f"3) VERIFIER task to run and verify those tests."
+        ),
+        assigned_role="ARCHITECT",
+        status="TODO",
+        input_data={"design_doc_content": design_content}
+    )
+    print("Seed task 'Decompose System Design' added to Kanban board.")
+    
+    # 5. Start the dispatcher orchestration loop
+    asyncio.run(run_orchestrator(workspace_path=args.workspace))
 
 if __name__ == "__main__":
     main()
