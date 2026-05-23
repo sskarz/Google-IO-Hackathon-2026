@@ -3,12 +3,14 @@ import os
 from typing import Dict, Any, List, Set
 from google.antigravity import Agent, LocalAgentConfig
 from google.antigravity.hooks import policy
-from db import get_ready_tasks, update_task_status, complete_task, get_all_tasks, kanban_show_tasks, kanban_create_task, add_task, add_dependency
+from db import get_ready_tasks, update_task_status, complete_task, get_all_tasks, kanban_show_tasks, kanban_create_task, add_task, add_dependency, find_available_port
 from agents import (
     ARCHITECT_INSTRUCTIONS,
-    MOCKER_INSTRUCTIONS,
+    BACKEND_INSTRUCTIONS,
+    FRONTEND_INSTRUCTIONS,
     TESTER_INSTRUCTIONS,
     VERIFIER_INSTRUCTIONS,
+    E2E_VERIFIER_INSTRUCTIONS,
     DecompositionOutput,
     TaskExecutionOutput,
     TaskVerificationOutput
@@ -30,24 +32,38 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
     if role == "ARCHITECT":
         instructions = ARCHITECT_INSTRUCTIONS
         schema = DecompositionOutput
-        policies = policy.confirm_run_command()  # Default: denies shell
-    elif role == "MOCKER":
-        instructions = MOCKER_INSTRUCTIONS
+        policies = policy.confirm_run_command()
+    elif role == "MOCKER" or role == "BACKEND":
+        instructions = BACKEND_INSTRUCTIONS
         schema = TaskExecutionOutput
-        policies = policy.confirm_run_command()  # Default: denies shell
+        policies = policy.confirm_run_command()
+    elif role == "FRONTEND":
+        instructions = FRONTEND_INSTRUCTIONS
+        schema = TaskExecutionOutput
+        policies = policy.confirm_run_command()
     elif role == "TESTER":
         instructions = TESTER_INSTRUCTIONS
         schema = TaskExecutionOutput
-        policies = policy.confirm_run_command()  # Default: denies shell
+        policies = policy.confirm_run_command()
     elif role == "VERIFIER":
         instructions = VERIFIER_INSTRUCTIONS
         schema = TaskVerificationOutput
-        # Allow running pytest commands, deny all others
         policies = [
             policy.allow(
                 "run_command",
                 when=lambda args: "pytest" in args.get("CommandLine", ""),
                 name="allow_pytest"
+            )
+        ] + policy.confirm_run_command()
+    elif role == "E2E_VERIFIER":
+        instructions = E2E_VERIFIER_INSTRUCTIONS
+        schema = TaskVerificationOutput
+        # Allow starting uvicorn/vite servers in background
+        policies = [
+            policy.allow(
+                "run_command",
+                when=lambda args: any(cmd in args.get("CommandLine", "") for cmd in ["uvicorn", "npm", "vite", "pytest", "curl", "bun"]),
+                name="allow_e2e_commands"
             )
         ] + policy.confirm_run_command()
     else:
@@ -59,7 +75,7 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
         response_schema=schema,
         workspaces=[abs_workspace],
         policies=policies,
-        tools=[kanban_show_tasks, kanban_create_task]
+        tools=[kanban_show_tasks, kanban_create_task, find_available_port]
     )
     
     try:
@@ -86,7 +102,7 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
                 result_dict = dict(result)
                 
             # For verification task, check if it passed
-            if role == "VERIFIER":
+            if role in ("VERIFIER", "E2E_VERIFIER"):
                 success = result_dict.get("success", False)
                 if not success:
                     error_msg = (

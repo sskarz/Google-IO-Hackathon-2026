@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import os
+import socket
 from typing import List, Dict, Any, Optional
 
 DB_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +25,7 @@ def init_db(db_path: str = DB_PATH) -> None:
                 title TEXT NOT NULL,
                 description TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('TODO', 'IN_PROGRESS', 'BLOCKED', 'DONE')),
-                assigned_role TEXT NOT NULL CHECK(assigned_role IN ('ARCHITECT', 'MOCKER', 'TESTER', 'VERIFIER')),
+                assigned_role TEXT NOT NULL CHECK(assigned_role IN ('ARCHITECT', 'MOCKER', 'BACKEND', 'FRONTEND', 'TESTER', 'VERIFIER', 'E2E_VERIFIER')),
                 input_data TEXT,
                 output_data TEXT,
                 error_msg TEXT
@@ -184,7 +185,7 @@ def kanban_create_task(
         task_id: A unique identifier for the task (e.g., 'task_verify_users').
         title: Short title of the task.
         description: Detailed instructions for the task executor.
-        assigned_role: The role required to run this task ('MOCKER', 'TESTER', 'VERIFIER').
+        assigned_role: The role required to run this task ('BACKEND', 'FRONTEND', 'TESTER', 'VERIFIER', 'E2E_VERIFIER').
         parent_task_ids: A list of task IDs that must complete BEFORE this task can run.
     """
     try:
@@ -203,3 +204,36 @@ def kanban_create_task(
         return f"Successfully created task '{title}' (ID: {task_id}){dep_str}."
     except Exception as e:
         return f"Failed to create task: {str(e)}"
+
+def find_available_port(role: str, start_port: int = 8000) -> int:
+    """Finds an available TCP port starting from start_port, and saves it in config.json.
+    
+    Args:
+        role: The service role ('BACKEND' or 'FRONTEND').
+        start_port: The port number to start scanning from.
+    """
+    port = start_port
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('localhost', port)) != 0:
+                # Port is available!
+                break
+        port += 1
+    
+    # Read existing config
+    config = {}
+    if os.path.exists("config.json"):
+        try:
+            with open("config.json", "r") as f:
+                config = json.load(f)
+        except Exception:
+            pass
+            
+    config[role.lower() + "_port"] = port
+    
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=4)
+        
+    print(f"Allocated {role} port: {port}")
+    return port
+

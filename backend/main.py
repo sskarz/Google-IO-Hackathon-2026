@@ -92,9 +92,11 @@ def main():
         description=(
             f"Read the system design document content provided in the input context. "
             f"Identify the endpoints, requirements, schemas, and decompose them into: "
-            f"1) MOCKER task to implement stubs/mocks. "
-            f"2) TESTER task to implement automated tests matching the stubs. "
-            f"3) VERIFIER task to run and verify those tests."
+            f"1) BACKEND task to implement database integration and API endpoints. "
+            f"2) FRONTEND task to build a responsive React/Vite/Tailwind UI dashboard. "
+            f"3) TESTER task to write a comprehensive automated test suite. "
+            f"4) VERIFIER task to run and verify the test suite. "
+            f"5) E2E_VERIFIER task to launch frontend and backend services, check their integration, and verify against design document."
         ),
         assigned_role="ARCHITECT",
         status="TODO",
