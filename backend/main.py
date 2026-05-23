@@ -47,6 +47,46 @@ def prepare_design_doc(path: str) -> str:
     with open(path, "r") as f:
         return f.read()
 
+ARCHITECT_TASK_ID = "task_architect_decomposer"
+
+ARCHITECT_TASK_DESCRIPTION = (
+    "Read the system design document content provided in the input context. "
+    "Identify the endpoints, requirements, schemas, and decompose them into: "
+    "1) BACKEND task to implement database integration and API endpoints. "
+    "2) FRONTEND task to build a responsive React/Vite/Tailwind UI dashboard. "
+    "3) TESTER task to write a comprehensive automated test suite. "
+    "4) VERIFIER task to run and verify the test suite. "
+    "5) E2E_VERIFIER task to launch frontend and backend services, check their integration, and verify against design document."
+)
+
+def reset_flow_state(workspace_path: str) -> None:
+    """Clears the orchestration database and generated workspace."""
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    if os.path.exists(workspace_path):
+        shutil.rmtree(workspace_path)
+
+def initialize_flow(design_content: str, workspace_path: str, reset: bool = False) -> None:
+    """Initializes the Kanban board and seeds the architect task."""
+    if reset:
+        reset_flow_state(workspace_path)
+
+    os.makedirs(workspace_path, exist_ok=True)
+    init_db()
+    add_task(
+        task_id=ARCHITECT_TASK_ID,
+        title="Decompose System Design",
+        description=ARCHITECT_TASK_DESCRIPTION,
+        assigned_role="ARCHITECT",
+        status="TODO",
+        input_data={"design_doc_content": design_content}
+    )
+
+async def run_full_flow(design_content: str, workspace_path: str, reset: bool = False) -> None:
+    """Seeds and runs the complete agent generation flow."""
+    initialize_flow(design_content=design_content, workspace_path=workspace_path, reset=reset)
+    await run_orchestrator(workspace_path=workspace_path)
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-Agent Kanban Orchestrator MVP")
     parser.add_argument(
@@ -70,38 +110,14 @@ def main():
     # 1. Reset if requested
     if args.reset:
         print("Resetting database and workspace...")
-        if os.path.exists(DB_PATH):
-            os.remove(DB_PATH)
-        if os.path.exists(args.workspace):
-            shutil.rmtree(args.workspace)
-            
-    # Ensure workspace exists
-    os.makedirs(args.workspace, exist_ok=True)
-    
-    # 2. Initialize DB
-    init_db()
-    print("Kanban database initialized.")
+        reset_flow_state(args.workspace)
     
     # 3. Read/prepare design document
     design_content = prepare_design_doc(args.design)
     
     # 4. Seed the initial Architect task to decompose the design
-    add_task(
-        task_id="task_architect_decomposer",
-        title="Decompose System Design",
-        description=(
-            f"Read the system design document content provided in the input context. "
-            f"Identify the endpoints, requirements, schemas, and decompose them into: "
-            f"1) BACKEND task to implement database integration and API endpoints. "
-            f"2) FRONTEND task to build a responsive React/Vite/Tailwind UI dashboard. "
-            f"3) TESTER task to write a comprehensive automated test suite. "
-            f"4) VERIFIER task to run and verify the test suite. "
-            f"5) E2E_VERIFIER task to launch frontend and backend services, check their integration, and verify against design document."
-        ),
-        assigned_role="ARCHITECT",
-        status="TODO",
-        input_data={"design_doc_content": design_content}
-    )
+    initialize_flow(design_content=design_content, workspace_path=args.workspace)
+    print("Kanban database initialized.")
     print("Seed task 'Decompose System Design' added to Kanban board.")
     
     # 5. Start the dispatcher orchestration loop
