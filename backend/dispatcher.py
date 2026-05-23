@@ -18,6 +18,7 @@ from agents import (
 )
 
 REQUIRED_TASK_ROLES = {"BACKEND", "FRONTEND", "TESTER", "VERIFIER", "E2E_VERIFIER"}
+MAX_REPAIR_ATTEMPTS = 2
 
 
 def validate_architect_task_graph(tasks_list: list[dict[str, Any]]) -> list[str]:
@@ -48,6 +49,119 @@ def validate_architect_task_graph(tasks_list: list[dict[str, Any]]) -> list[str]
             )
 
     return findings
+
+
+def repair_attempt_count(failed_task_id: str, tasks: list[dict[str, Any]]) -> int:
+    prefix = f"repair_{failed_task_id}_"
+    attempts: set[int] = set()
+    for task in tasks:
+        task_id = str(task.get("id", ""))
+        if not task_id.startswith(prefix):
+            continue
+        parts = task_id.removeprefix(prefix).split("_", 1)
+        if parts and parts[0].isdigit():
+            attempts.add(int(parts[0]))
+    return max(attempts, default=0)
+
+
+def determine_repair_roles(role: str, failure_text: str) -> list[str]:
+    """Map verifier failure output to the smallest useful set of repair agents."""
+    lowered = failure_text.lower()
+    roles: set[str] = set()
+
+    if "contract.json" in lowered or "e2e step" in lowered or "unsupported path" in lowered:
+        roles.add("BACKEND")
+        roles.add("TESTER")
+    if "backend python dependencies" in lowered or "requirements.txt" in lowered or "modulenotfounderror" in lowered:
+        roles.add("BACKEND")
+    if "pytest" in lowered or "test suite" in lowered or "import file mismatch" in lowered:
+        roles.add("TESTER")
+    if "frontend" in lowered or "react state" in lowered or "npm run build" in lowered:
+        roles.add("FRONTEND")
+    if role == "E2E_VERIFIER" and ("backend" in lowered or "uvicorn" in lowered or "http " in lowered):
+        roles.add("BACKEND")
+    if role == "E2E_VERIFIER" and ("frontend" in lowered or "vite" in lowered):
+        roles.add("FRONTEND")
+
+    if not roles:
+        roles.update({"BACKEND", "FRONTEND", "TESTER"})
+
+    role_order = ["BACKEND", "FRONTEND", "TESTER"]
+    return [candidate for candidate in role_order if candidate in roles]
+
+
+def build_repair_description(repair_role: str, failed_task: dict[str, Any], failure_text: str) -> str:
+    base = (
+        f"Repair the generated project after `{failed_task['title']}` failed deterministic verification.\n\n"
+        "You are not alone in this workspace. Preserve useful work from other agents and make the smallest "
+        "changes needed for the deterministic verifier to pass.\n\n"
+        "Failure report:\n"
+        f"{failure_text}\n\n"
+        "Universal repair rules:\n"
+        "- Work only inside generated_project.\n"
+        "- Do not weaken or remove tests to hide failures.\n"
+        "- Keep backend code in backend/ and frontend code in frontend/.\n"
+        "- Ensure contract.json uses only supported assertion paths: $.field and $[*].field.\n"
+        "- Ensure backend/requirements.txt lists every third-party Python import, including pydantic, pytest, uvicorn, fastapi, sqlalchemy, redis, httpx, or auth libraries if used.\n"
+        "- Ensure pytest files have unique basenames and live under backend/tests/; remove accidental duplicate root-level test_*.py files.\n"
+        "- Ensure frontend state for displayed records starts empty and is populated only by fetch() results.\n"
+    )
+
+    role_notes = {
+        "BACKEND": (
+            "\nBackend-specific focus:\n"
+            "- Fix backend code, backend requirements, and contract/backend mismatches.\n"
+            "- If contract.json is malformed, repair it while keeping it aligned with implemented endpoints.\n"
+        ),
+        "FRONTEND": (
+            "\nFrontend-specific focus:\n"
+            "- Fix frontend hardcoded display data, build failures, config loading, and real fetch integration.\n"
+            "- Do not add fake fallback books, users, carts, or orders.\n"
+        ),
+        "TESTER": (
+            "\nTester-specific focus:\n"
+            "- Fix pytest collection/runtime failures and make tests assert real API data flow.\n"
+            "- Do not create duplicate test module basenames.\n"
+        ),
+    }
+    return base + role_notes.get(repair_role, "")
+
+
+def schedule_repair_cycle(failed_task: dict[str, Any], failure_text: str) -> bool:
+    """Create targeted repair tasks and reset the failed verifier task to retry.
+
+    Returns True if repair tasks were scheduled, False if the retry budget is exhausted.
+    """
+    failed_task_id = failed_task["id"]
+    attempt = repair_attempt_count(failed_task_id, get_all_tasks()) + 1
+    if attempt > MAX_REPAIR_ATTEMPTS:
+        return False
+
+    repair_roles = determine_repair_roles(failed_task["assigned_role"], failure_text)
+    print(
+        f"*** [REPAIR] Scheduling attempt {attempt}/{MAX_REPAIR_ATTEMPTS} for "
+        f"{failed_task_id}: {', '.join(repair_roles)}"
+    )
+
+    for repair_role in repair_roles:
+        repair_task_id = f"repair_{failed_task_id}_{attempt}_{repair_role.lower()}"
+        add_task(
+            task_id=repair_task_id,
+            title=f"Repair {repair_role.title()} After Verification Failure",
+            description=build_repair_description(repair_role, failed_task, failure_text),
+            assigned_role=repair_role,
+            status="TODO",
+            input_data={
+                "failed_task_id": failed_task_id,
+                "failed_task_role": failed_task["assigned_role"],
+                "repair_attempt": attempt,
+                "failure_report": failure_text,
+            },
+        )
+        add_dependency(parent_id=repair_task_id, child_id=failed_task_id)
+
+    update_task_status(failed_task_id, "TODO")
+    return True
 
 
 async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
@@ -167,6 +281,9 @@ async def execute_task(task: Dict[str, Any], workspace_path: str) -> None:
                         f"Failure Reason: {result_dict.get('reasons_for_failure')}"
                     )
                     print(f"xxx [FAILED] Verification failed for task: '{task['title']}'")
+                    if schedule_repair_cycle(task, error_msg):
+                        print(f"*** [REPAIR] {task_id} reset to TODO and will rerun after repairs complete.")
+                        return
                     update_task_status(task_id, "BLOCKED", error_msg=error_msg)
                     return
             

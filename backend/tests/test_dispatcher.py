@@ -1,4 +1,4 @@
-from dispatcher import validate_architect_task_graph
+from dispatcher import determine_repair_roles, repair_attempt_count, validate_architect_task_graph
 
 
 def test_architect_task_graph_requires_verifier_to_wait_for_tester():
@@ -33,3 +33,27 @@ def test_architect_task_graph_accepts_required_role_dependencies():
     ]
 
     assert validate_architect_task_graph(tasks) == []
+
+
+def test_repair_roles_are_targeted_from_verifier_failures():
+    failure = """
+    contract.json declares executable E2E steps: unsupported path '$[0].id'
+    static anti-shortcut scan: frontend/src/App.jsx hardcoded display data
+    backend Python dependencies are declared: missing requirement: pydantic
+    pytest execution: import file mismatch
+    """
+
+    roles = determine_repair_roles("VERIFIER", failure)
+
+    assert roles == ["BACKEND", "FRONTEND", "TESTER"]
+
+
+def test_repair_attempt_count_reads_existing_repair_tasks():
+    tasks = [
+        {"id": "repair_task_verifier_1_backend"},
+        {"id": "repair_task_verifier_1_tester"},
+        {"id": "repair_task_verifier_2_frontend"},
+        {"id": "task_verifier"},
+    ]
+
+    assert repair_attempt_count("task_verifier", tasks) == 2
