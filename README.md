@@ -4,25 +4,34 @@ Voice-driven system design tool. Speak a description aloud; the app produces bot
 
 ---
 
-## Pipeline
+## Pipelines & Agent Capabilities
 
+The platform operates on two distinct interactive pipelines:
+
+### 1. The Real-time Interactive Gemini Live Auditor (`/auditor/ws`)
+This bidirectional voice loop leverages the **Gemini Live API** (`gemini-3.1-flash-live-preview`) to conduct a real-time system design interview. 
+- **Voice Loop**: Processes low-latency raw PCM audio packets streaming over a WebSocket connection.
+- **Dynamic Hardening**: Features a 5-phase red-teaming cycle (Discuss, Confirm, Red-Team, Harden, Transition) across four sections: Goals, Architecture, Components, and Data Flow.
+- **Tool-Calling Integration**: Live-calls `confirm_section` or `finalize_design` to rewrite the design and update the diagram in real time as the conversation progresses.
+
+### 2. The Static Browser Voice Pipeline (`/generate-design` & `/generate-spec`)
+A simpler, one-shot voice-to-design tool:
 ```
-mic → Web Speech API (browser STT)
-        │
-        ▼
-   POST /generate-design (Antigravity / Gemini)
-        │
-        ▼
-     DESIGN.md  ──────────────┐
-        │                     │
-        ▼                     ▼
-   GET /design-md       POST /generate-spec (google-genai, structured JSON)
-        │                     │
-        ▼                     ▼
-   <DesignViewer>         Zod validate → <SpecCanvas> (Three.js + ELK)
+mic → Web Speech API (STT) → POST /generate-design (google-antigravity)
+                                         │
+                                         ▼
+                                     DESIGN.md  ──────────────┐
+                                         │                     │
+                                         ▼                     ▼
+                                    GET /design-md       POST /generate-spec (structured JSON)
+                                         │                     │
+                                         ▼                     ▼
+                                    <DesignViewer>        <SpecCanvas> (Three.js 3D viz)
 ```
 
-Two backends share one source of truth (`DESIGN.md`). The DESIGN.md generator uses `google-antigravity`; the spec generator uses `google-genai` with `response_schema` for strict structured output.
+### 3. Background Multi-Agent Generation & Dispatcher Auto-Repair (`main.py` / `dispatcher.py`)
+When the system design is complete, a static multi-agent code-generation flow (`/start-flow`) runs in the background. It orchestrates a multi-agent swarm (`BACKEND`, `FRONTEND`, `TESTER`, `VERIFIER`, `E2E_VERIFIER`) using the Google Antigravity (AGY) SDK to automatically write and test the full-stack codebase.
+- **Automatic Repair Cycle**: If a verifier task fails deterministic checks, `dispatcher.py` dynamically parses the failure logs, maps them to the minimal required repair agents (`BACKEND`, `FRONTEND`, or `TESTER`), schedules blocking repair tasks, and resets the verifier to re-run (capped at a budget of `2` retries).
 
 ---
 

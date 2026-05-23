@@ -2,7 +2,19 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a Python backend and a Vite/React frontend. Backend code lives in `backend/`, with orchestration entry points such as `main.py`, `dispatcher.py`, `agents.py`, API code in `sys_design_doc_api.py`, SQLite helpers in `db.py`, sample design documents in `backend/docs/`, and pytest tests in `backend/tests/`. Frontend code lives in `frontend/src/`, with `App.tsx` as the main UI, reusable components in `frontend/src/components/`, hooks in `frontend/src/hooks/`, and static assets in `frontend/public/` or `frontend/src/assets/`. Generated files such as `DESIGN.md`, local databases, credentials, and workspaces should not be treated as source.
+This repository contains a Python backend and a Vite/React frontend.
+- **Backend (`backend/`)**:
+  - `main.py`: Entrypoint for running the static multi-agent code-generation flow.
+  - `dispatcher.py`: Task dispatcher utilizing Google Antigravity. Features an **auto-repair retry engine** (`schedule_repair_cycle`) that intercepts verifier failures, analyzes logs, creates targeted coding repairs for `BACKEND`, `FRONTEND`, or `TESTER` agents, and schedules them as blockers to resolve code bugs dynamically (budgeted at 2 cycles max).
+  - `agents.py`: Holds agent prompt templates and persona setup.
+  - `sys_design_doc_api.py`: FastAPI server exposing `/start-flow`, `/flow-status`, `/generate-design`, `/generate-spec`, and the real-time bidirectional audio WebSocket route `/auditor/ws` (using Gemini Live API).
+  - `db.py`: SQLite db helpers.
+  - `tests/`: Unit tests (such as test suites for dispatcher repair-tracking logic).
+- **Frontend (`frontend/`)**:
+  - `src/App.tsx`: Central dashboard interface.
+  - `src/components/`: Modular widgets including `AuditorPanel.tsx` (real-time voice interface) and `SpecCanvas.tsx` (Three.js 3D diagram renderer).
+  - `src/hooks/`: Reusable react hooks including `useLiveAudio.ts` and `useSpeechRecognition.ts`.
+  - Generated files such as `DESIGN.md`, `DESIGN_AUTH.md`, local databases, credentials, and workspaces should not be treated as source.
 
 ## Build, Test, and Development Commands
 
