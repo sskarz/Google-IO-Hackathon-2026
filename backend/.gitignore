@@ -70,3 +70,8 @@ db.sqlite3
 generated_project/
 kanban.db
 
+# GCP Credentials and Archives
+gcp-credentials.json
+*.tar.gz
+
+
