@@ -1,14 +1,19 @@
+import asyncio
+import base64
 import json
+import logging
 import os
-import re
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+logging.basicConfig(level=logging.INFO)
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
-from google.antigravity import Agent, LocalAgentConfig
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -17,6 +22,8 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 PROJECT_ROOT = Path(__file__).parent.parent
 DESIGN_MD = PROJECT_ROOT / "DESIGN.md"
 SPEC_MODEL = os.getenv("GEMINI_SPEC_MODEL", "gemini-2.5-pro")
+AUDITOR_MODEL = "gemini-3.5-flash"
+TTS_MODEL = "gemini-2.5-flash-preview-tts"
 
 app = FastAPI()
 
@@ -27,36 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DESIGN_SYSTEM_PROMPT = """\
-You are a senior software architect. The user has verbally described a system they want to build.
-Convert their transcript into a structured DESIGN.md with exactly these sections:
-
-# Overview
-## Goals
-## Architecture
-## Components
-## Data Flow
-
-Be concrete. Infer reasonable defaults where the user was vague.
-Output only the markdown — no preamble, no code fences around the whole document.
-"""
-
-AUDIT_SYSTEM_PROMPT = """\
-You are a senior software architect auditing a system design document written by a colleague.
-Your job is to surface problems and gather missing information.
-
-Identify:
-- Critical issues: missing components, inconsistencies, scalability risks, security gaps, unclear ownership
-- Follow-up questions: specific questions to ask the designer to clarify intent and fill gaps
-
-Return ONLY a JSON object — no prose, no markdown fences — in this exact shape:
-{
-  "issues": ["issue 1", "issue 2"],
-  "questions": ["question 1", "question 2"]
-}
-
-Aim for 3–7 issues and 3–7 questions. Be specific, not generic.
-"""
+# ── Spec models (untouched) ────────────────────────────────────────────────────
 
 SPEC_SYSTEM_PROMPT = """\
 You are a system architecture interpreter. You read system design
@@ -104,7 +82,6 @@ mentions a boundary (VPC, region, AZ, cluster). When ambiguous about
 a connection, omit it rather than guess.
 """
 
-
 NodeType = Literal[
     "client", "cdn", "load_balancer", "api_gateway",
     "service", "worker", "database", "cache", "queue",
@@ -124,7 +101,6 @@ class SpecNode(BaseModel):
 
 
 class SpecEdge(BaseModel):
-    # `from` is a Python keyword; use alias so JSON keeps the spec field name.
     model_config = ConfigDict(populate_by_name=True)
     id: str
     from_: str = Field(alias="from")
@@ -151,25 +127,6 @@ class Spec(BaseModel):
     edges: list[SpecEdge]
     groups: list[SpecGroup] | None = None
     metadata: SpecMetadata | None = None
-
-class TranscriptRequest(BaseModel):
-    transcript: str
-
-
-async def generate_markdown(transcript: str) -> str:
-    config = LocalAgentConfig(system_instructions=DESIGN_SYSTEM_PROMPT)
-    async with Agent(config) as agent:
-        response = await agent.chat(transcript)
-        return await response.text()
-
-
-async def run_audit(design_content: str) -> dict:
-    config = LocalAgentConfig(system_instructions=AUDIT_SYSTEM_PROMPT)
-    async with Agent(config) as agent:
-        response = await agent.chat(design_content)
-        raw = await response.text()
-    cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-    return json.loads(cleaned)
 
 
 def validate_spec_integrity(spec: Spec) -> list[str]:
@@ -227,22 +184,257 @@ def call_gemini_for_spec(prompt: str, api_key: str) -> Spec:
     return Spec.model_validate(data)
 
 
-@app.get("/audit")
-async def audit_design():
-    if not os.getenv("GEMINI_API_KEY"):
+# ── Auditor ────────────────────────────────────────────────────────────────────
+
+DESIGN_SECTIONS = ["goals", "architecture", "components", "data_flow"]
+
+AUDITOR_SYSTEM_PROMPT = """\
+You are a senior software architect conducting a voice interview to build a system design document.
+Work through these four sections strictly in order:
+  1. goals        — what the system does, the problem it solves, key goals and non-goals
+  2. architecture — high-level approach: monolith/microservices, sync/async, main patterns
+  3. components   — individual services/components and their responsibilities
+  4. data_flow    — how requests and data move through the system, external integrations
+
+Rules:
+- Focus on ONE section at a time — the one listed as current_section in your context.
+- Ask 1–2 targeted questions per turn to build understanding of that section.
+- Only confirm a section when you have CONCRETE, specific detail — not vague generalities.
+- When you have enough to write a complete, well-scoped section:
+    - Set section_confirmed to that section's key (e.g. "goals")
+    - Set section_content to well-written markdown for that section (include the ## heading)
+- After confirming a section, naturally introduce the next one in your response.
+- When all four sections are confirmed (all_sections_done: true in context), set all_done: true
+  and populate full_design with the complete integrated document.
+
+Section content format:
+  goals:        "## Goals\n- <bullet per goal>\n\n### Non-Goals\n- <bullet if mentioned>"
+  architecture: "## Architecture\n<paragraph describing high-level approach and key decisions>"
+  components:   "## Components\n### ComponentName\n<role and responsibilities>"
+  data_flow:    "## Data Flow\n1. <numbered steps of key request/data flows>"
+
+Response rules:
+1. response is 2–3 sentences max — it is spoken aloud, keep it natural and conversational, no lists.
+2. transcript must be verbatim transcription of what the user said in the audio.
+3. full_design (only when all_done=true) uses exactly this structure:
+   # <System Name>
+   ## Overview
+   <one concise paragraph>
+   ## Goals
+   <content>
+   ## Architecture
+   <content>
+   ## Components
+   <content>
+   ## Data Flow
+   <content>
+4. Output only valid JSON matching the schema. No prose outside the JSON.
+"""
+
+DESIGN_WRITER_PROMPT = """\
+You are a senior software architect. Based on the conversation history provided,
+write a complete system design document. Use exactly these sections:
+# <System Name>
+## Overview
+## Goals
+## Architecture
+## Components
+## Data Flow
+Be concrete. Output only the markdown — no preamble, no code fences.
+"""
+
+
+class AuditorTurnResponse(BaseModel):
+    transcript: str
+    response: str
+    section_confirmed: str | None = None
+    section_content: str | None = None
+    all_done: bool = False
+    full_design: str | None = None
+
+
+@dataclass
+class AuditSession:
+    history: list[dict] = field(default_factory=list)
+    sections_confirmed: dict[str, str] = field(default_factory=dict)
+    design_saved: bool = False
+
+
+_session = AuditSession()
+
+
+def _build_system_prompt() -> str:
+    confirmed = list(_session.sections_confirmed.keys())
+    remaining = [s for s in DESIGN_SECTIONS if s not in _session.sections_confirmed]
+    current = remaining[0] if remaining else None
+    all_done = len(remaining) == 0
+
+    state = (
+        "\n---\nCurrent session state:\n"
+        f"- Sections confirmed so far: {', '.join(confirmed) if confirmed else 'none yet'}\n"
+        f"- Current section to discuss: {current if current else 'all confirmed'}\n"
+        f"- all_sections_done: {str(all_done).lower()}\n"
+    )
+    return AUDITOR_SYSTEM_PROMPT + state
+
+
+def _write_sections_to_design() -> None:
+    parts = []
+    for key in DESIGN_SECTIONS:
+        content = _session.sections_confirmed.get(key)
+        if content:
+            parts.append(content.strip())
+    DESIGN_MD.write_text("\n\n".join(parts), encoding="utf-8")
+
+
+def _call_auditor(ogg_bytes: bytes, api_key: str) -> AuditorTurnResponse:
+    client = genai.Client(api_key=api_key)
+
+    contents: list[types.Content] = []
+    for msg in _session.history:
+        contents.append(
+            types.Content(role=msg["role"], parts=[types.Part.from_text(msg["text"])])
+        )
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[types.Part(inline_data=types.Blob(data=ogg_bytes, mime_type="audio/ogg"))],
+        )
+    )
+
+    response = client.models.generate_content(
+        model=AUDITOR_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=_build_system_prompt(),
+            thinking_config=types.ThinkingConfig(thinking_budget=2048),
+            response_mime_type="application/json",
+            response_schema=AuditorTurnResponse,
+            temperature=0.3,
+        ),
+    )
+    data = json.loads(response.text or "{}")
+    return AuditorTurnResponse.model_validate(data)
+
+
+def _call_tts(text: str, api_key: str) -> tuple[bytes, str]:
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=TTS_MODEL,
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["audio"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+                )
+            ),
+        ),
+    )
+    part = response.candidates[0].content.parts[0]
+    raw = part.inline_data.data
+    audio_bytes = base64.b64decode(raw) if isinstance(raw, str) else raw
+    return audio_bytes, part.inline_data.mime_type
+
+
+def _force_write_design(api_key: str) -> None:
+    client = genai.Client(api_key=api_key)
+    history_text = "\n\n".join(
+        f"{m['role'].upper()}: {m['text']}" for m in _session.history
+    )
+    response = client.models.generate_content(
+        model=AUDITOR_MODEL,
+        contents=history_text,
+        config=types.GenerateContentConfig(
+            system_instruction=DESIGN_WRITER_PROMPT,
+            temperature=0.2,
+        ),
+    )
+    DESIGN_MD.write_text(response.text or "", encoding="utf-8")
+    _session.design_saved = True
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.post("/auditor/turn")
+async def auditor_turn(audio: UploadFile = File(...)):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set.")
-    if not DESIGN_MD.exists():
-        raise HTTPException(status_code=404, detail="DESIGN.md not found. Generate a design first.")
-    content = DESIGN_MD.read_text(encoding="utf-8").strip()
-    if not content:
-        raise HTTPException(status_code=400, detail="DESIGN.md is empty.")
+    if _session.design_saved:
+        raise HTTPException(status_code=400, detail="Design already saved. Reset to start over.")
+
+    ogg_bytes = await audio.read()
+    if not ogg_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file.")
+
     try:
-        result = await run_audit(content)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"Auditor returned invalid JSON: {e}")
+        result = _call_auditor(ogg_bytes, api_key)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Antigravity error: {e}")
-    return {"issues": result.get("issues", []), "questions": result.get("questions", [])}
+        raise HTTPException(status_code=502, detail=f"Auditor error: {e}")
+
+    _session.history.append({"role": "user", "text": result.transcript})
+    _session.history.append({"role": "model", "text": result.response})
+
+    # Write section immediately when confirmed for the first time
+    if (
+        result.section_confirmed
+        and result.section_content
+        and result.section_confirmed in DESIGN_SECTIONS
+        and result.section_confirmed not in _session.sections_confirmed
+    ):
+        _session.sections_confirmed[result.section_confirmed] = result.section_content
+        _write_sections_to_design()
+
+    if result.all_done and result.full_design and not _session.design_saved:
+        DESIGN_MD.write_text(result.full_design, encoding="utf-8")
+        _session.design_saved = True
+
+    remaining = [s for s in DESIGN_SECTIONS if s not in _session.sections_confirmed]
+    current_section = remaining[0] if remaining else None
+    sections_progress = {s: s in _session.sections_confirmed for s in DESIGN_SECTIONS}
+
+    audio_b64: str | None = None
+    audio_mime = "audio/pcm;rate=24000"
+    tts_error: str | None = None
+    try:
+        audio_bytes, audio_mime = _call_tts(result.response, api_key)
+        audio_b64 = base64.b64encode(audio_bytes).decode()
+    except Exception as e:
+        tts_error = str(e)
+
+    return {
+        "sections_progress": sections_progress,
+        "current_section": current_section,
+        "design_saved": _session.design_saved,
+        "audio": audio_b64,
+        "audio_mime": audio_mime,
+        "tts_error": tts_error,
+    }
+
+
+@app.post("/auditor/done")
+async def auditor_done():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set.")
+    if not _session.history:
+        raise HTTPException(status_code=400, detail="No conversation to finalize.")
+
+    if not _session.design_saved:
+        try:
+            _force_write_design(api_key)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Design write error: {e}")
+
+    return {"design_saved": True}
+
+
+@app.post("/auditor/reset")
+async def auditor_reset():
+    global _session
+    _session = AuditSession()
+    return {"reset": True}
 
 
 @app.get("/design-md")
@@ -250,24 +442,6 @@ async def get_design():
     if not DESIGN_MD.exists():
         return {"content": ""}
     return {"content": DESIGN_MD.read_text(encoding="utf-8")}
-
-
-@app.post("/generate-design")
-async def generate_design(body: TranscriptRequest):
-    if not body.transcript.strip():
-        raise HTTPException(status_code=400, detail="Transcript is empty.")
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set.")
-
-    try:
-        markdown = await generate_markdown(body.transcript.strip())
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Antigravity error: {e}")
-
-    DESIGN_MD.write_text(markdown, encoding="utf-8")
-
-    preview = markdown[:300] + ("…" if len(markdown) > 300 else "")
-    return {"success": True, "preview": preview}
 
 
 @app.post("/generate-spec")
@@ -314,3 +488,281 @@ async def generate_spec():
             )
 
     return spec.model_dump(by_alias=True, exclude_none=True)
+
+
+# ── Gemini Live API ────────────────────────────────────────────────────────────
+
+LIVE_MODEL = "gemini-3.1-flash-live-preview"
+
+LIVE_SYSTEM_PROMPT = """\
+You are a senior software architect conducting a friendly voice conversation to build a system design document.
+
+Work through these four sections IN ORDER. Only move to the next section after the current one is confirmed.
+  1. goals        — what the system does, the problem it solves, key goals and non-goals
+  2. architecture — high-level approach (monolith/microservices, sync/async, key patterns)
+  3. components   — individual services/components and their responsibilities
+  4. data_flow    — how data and requests move through the system
+
+Rules:
+- Speak naturally — responses will be played as audio. Keep them to 2–3 sentences max.
+- Ask 1–2 focused questions per turn to understand the current section.
+- When you have concrete, specific detail for a section — not vague generalities — call confirm_section.
+- After confirming each section, briefly acknowledge it and introduce the next topic naturally.
+- When all four sections are confirmed, call finalize_design with the complete markdown document.
+
+Section content format for confirm_section (include the ## heading):
+  goals:        "## Goals\n- <goal bullets>\n\n### Non-Goals\n- <if mentioned>"
+  architecture: "## Architecture\n<clear paragraph on high-level approach>"
+  components:   "## Components\n### Name\n<role and responsibilities per component>"
+  data_flow:    "## Data Flow\n1. <numbered steps of key flows>"
+
+Start immediately: greet the user warmly and ask what system they want to build.
+"""
+
+LIVE_TOOLS = [
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="confirm_section",
+                description="Call when you have enough concrete information to write a complete design section",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "section_key": {
+                            "type": "string",
+                            "description": "One of: goals, architecture, components, data_flow",
+                        },
+                        "section_content": {
+                            "type": "string",
+                            "description": "Complete markdown for the section including its ## heading",
+                        },
+                    },
+                    "required": ["section_key", "section_content"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="finalize_design",
+                description="Call when all four sections are confirmed to write the complete design document",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "full_design": {
+                            "type": "string",
+                            "description": "Complete DESIGN.md markdown with all sections",
+                        },
+                    },
+                    "required": ["full_design"],
+                },
+            ),
+        ]
+    )
+]
+
+
+async def _handle_live_tool(name: str, args: dict, websocket: WebSocket) -> str:
+    global _session
+    if name == "confirm_section":
+        key = args.get("section_key", "")
+        content = args.get("section_content", "")
+        if key in DESIGN_SECTIONS and key not in _session.sections_confirmed:
+            _session.sections_confirmed[key] = content
+            _write_sections_to_design()
+            remaining = [s for s in DESIGN_SECTIONS if s not in _session.sections_confirmed]
+            await websocket.send_text(json.dumps({
+                "type": "progress",
+                "sections_progress": {s: s in _session.sections_confirmed for s in DESIGN_SECTIONS},
+                "current_section": remaining[0] if remaining else None,
+            }))
+        return "saved"
+
+    if name == "finalize_design":
+        full = args.get("full_design", "")
+        if full and not _session.design_saved:
+            DESIGN_MD.write_text(full, encoding="utf-8")
+            _session.design_saved = True
+            await websocket.send_text(json.dumps({
+                "type": "design_saved",
+                "sections_progress": {s: True for s in DESIGN_SECTIONS},
+                "current_section": None,
+            }))
+        return "saved"
+
+    return "unknown tool"
+
+
+@app.websocket("/auditor/ws")
+async def auditor_ws(websocket: WebSocket):
+    await websocket.accept()
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        await websocket.send_text(json.dumps({"type": "error", "message": "GEMINI_API_KEY not set"}))
+        await websocket.close()
+        return
+
+    global _session
+    _session = AuditSession()
+
+    client = genai.Client(api_key=api_key)
+    stop = asyncio.Event()
+    user_done = False
+
+    live_config = {
+        "response_modalities": ["AUDIO"],
+        "system_instruction": LIVE_SYSTEM_PROMPT,
+        "tools": LIVE_TOOLS,
+        "speech_config": types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+            )
+        ),
+        "context_window_compression": types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow()
+        ),
+    }
+
+    try:
+        logging.info("opening gemini live session (single session for this browser ws)")
+        async with client.aio.live.connect(model=LIVE_MODEL, config=live_config) as session:
+            # Greet ONCE per session
+            await session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(text="Hello")])],
+                turn_complete=True,
+            )
+
+            async def recv_from_browser():
+                nonlocal user_done
+                try:
+                    while not stop.is_set():
+                        msg = await websocket.receive()
+                        if msg.get("type") == "websocket.disconnect":
+                            logging.info("recv_from_browser: client disconnected")
+                            stop.set()
+                            return
+                        if "bytes" in msg and msg["bytes"]:
+                            try:
+                                await session.send_realtime_input(
+                                    audio=types.Blob(data=msg["bytes"], mime_type="audio/pcm;rate=16000")
+                                )
+                            except Exception as e:
+                                logging.warning(f"send_realtime_input failed: {e}")
+                                stop.set()
+                                return
+                        elif "text" in msg:
+                            try:
+                                data = json.loads(msg["text"])
+                                t = data.get("type")
+                                if t == "done":
+                                    user_done = True
+                                    stop.set()
+                                    return
+                                elif t == "mute":
+                                    # Per docs: flush cached audio when stream pauses
+                                    try:
+                                        await session.send_realtime_input(audio_stream_end=True)
+                                        logging.info("sent audio_stream_end (mute)")
+                                    except Exception as e:
+                                        logging.warning(f"audio_stream_end failed: {e}")
+                            except Exception:
+                                pass
+                except WebSocketDisconnect:
+                    stop.set()
+                except Exception as e:
+                    logging.error(f"recv_from_browser error: {e}\n{traceback.format_exc()}")
+                    stop.set()
+
+            async def recv_from_gemini():
+                """
+                Wraps session.receive() in an outer while loop. The SDK's receive()
+                iterator may end at turn_complete even though the WS stays open —
+                we re-enter and call receive() again. Only an actual exception
+                (ConnectionClosedError) means the session truly ended.
+                """
+                try:
+                    logging.info("recv_from_gemini: started")
+                    while not stop.is_set():
+                        got_any = False
+                        async for msg in session.receive():
+                            got_any = True
+                            if stop.is_set():
+                                break
+
+                            go_away = getattr(msg, "go_away", None)
+                            if go_away:
+                                logging.warning(
+                                    f"GoAway received, time_left={getattr(go_away, 'time_left', None)}"
+                                )
+
+                            sc = getattr(msg, "server_content", None)
+                            if sc and getattr(sc, "turn_complete", False):
+                                logging.info("turn_complete received (session stays open)")
+
+                            if hasattr(msg, "data") and msg.data:
+                                raw = msg.data
+                                audio = base64.b64decode(raw) if isinstance(raw, str) else raw
+                                try:
+                                    await websocket.send_bytes(audio)
+                                except Exception:
+                                    stop.set()
+                                    return
+
+                            tc = getattr(msg, "tool_call", None)
+                            if tc:
+                                responses = []
+                                for fc in getattr(tc, "function_calls", None) or []:
+                                    result = await _handle_live_tool(fc.name, fc.args or {}, websocket)
+                                    responses.append(types.FunctionResponse(
+                                        id=fc.id, name=fc.name, response={"result": result}
+                                    ))
+                                if responses:
+                                    await session.send_tool_response(function_responses=responses)
+                                # Design finalized — stop everything
+                                if _session.design_saved:
+                                    logging.info("design saved, closing session")
+                                    stop.set()
+                                    return
+                        # Iterator ended. If we got nothing, brief sleep to avoid spin.
+                        if not got_any:
+                            await asyncio.sleep(0.05)
+                    logging.info("recv_from_gemini: exiting (stop set)")
+                except Exception as e:
+                    logging.error(f"recv_from_gemini error: {e}\n{traceback.format_exc()}")
+                finally:
+                    stop.set()
+
+            browser_task = asyncio.create_task(recv_from_browser())
+            gemini_task = asyncio.create_task(recv_from_gemini())
+
+            await asyncio.wait(
+                [browser_task, gemini_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            stop.set()
+            for t in (browser_task, gemini_task):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logging.error(f"auditor_ws outer error: {e}\n{traceback.format_exc()}")
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
+    finally:
+        if not _session.design_saved:
+            _write_sections_to_design()
+        if user_done:
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "design_saved",
+                    "sections_progress": {s: s in _session.sections_confirmed for s in DESIGN_SECTIONS},
+                    "current_section": None,
+                }))
+            except Exception:
+                pass

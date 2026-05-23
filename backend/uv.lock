@@ -61,7 +61,9 @@ dependencies = [
     { name = "google-genai" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "python-multipart" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -71,7 +73,9 @@ requires-dist = [
     { name = "google-genai", specifier = ">=1.33.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "python-multipart", specifier = ">=0.0.29" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.47.0" },
+    { name = "websockets", specifier = ">=16.0" },
 ]
 
 [[package]]

@@ -528,3 +528,168 @@
   border-radius: 4px;
   white-space: nowrap;
 }
+
+/* ── Auditor Panel ─────────────────────────────────────────────────────────── */
+
+.auditor-panel {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.auditor-checklist {
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.checklist-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+
+.checklist-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.checklist-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
+.checklist-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.checklist-item {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text);
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+
+  &.done {
+    background: color-mix(in srgb, #1a9e5c 12%, transparent);
+    border-color: color-mix(in srgb, #1a9e5c 30%, transparent);
+    color: #1a9e5c;
+  }
+
+  &.active {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border-color: var(--accent-border);
+    color: var(--accent);
+    font-weight: 600;
+  }
+}
+
+.auditor-status-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 48px 24px;
+  flex: 1;
+}
+
+.auditor-orb {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: var(--border);
+  transition: background 0.4s, box-shadow 0.4s;
+
+  &.listening {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
+    animation: orb-breathe 3s ease-in-out infinite;
+  }
+
+  &.speaking {
+    background: var(--accent);
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.4);
+    animation: orb-pulse-speak 0.75s ease-in-out infinite;
+  }
+
+  &.loading {
+    background: color-mix(in srgb, var(--accent) 25%, transparent);
+    animation: orb-spin 1.4s linear infinite;
+  }
+}
+
+@keyframes orb-breathe {
+  0%, 100% { transform: scale(1);    opacity: 0.65; }
+  50%       { transform: scale(1.08); opacity: 1; }
+}
+
+@keyframes orb-pulse-speak {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.45); transform: scale(1); }
+  50%       { box-shadow: 0 0 0 16px rgba(99, 102, 241, 0);  transform: scale(1.07); }
+}
+
+@keyframes orb-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.auditor-status-text {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+  font-style: italic;
+  text-align: center;
+}
+
+.auditor-controls {
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.auditor-btns {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.auditor-error {
+  font-size: 13px;
+  color: #d4334e;
+  margin: 0;
+}
+
+.done-btn {
+  appearance: none;
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s, transform 0.15s;
+
+  &:hover:not(:disabled) { opacity: 0.88; transform: translateY(-1px); }
+  &:disabled { opacity: 0.45; cursor: not-allowed; }
+}
