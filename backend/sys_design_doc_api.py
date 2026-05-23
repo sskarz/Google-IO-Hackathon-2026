@@ -1,4 +1,6 @@
+import json
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,7 +23,7 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-SYSTEM_PROMPT = """\
+DESIGN_SYSTEM_PROMPT = """\
 You are a senior software architect. The user has verbally described a system they want to build.
 Convert their transcript into a structured DESIGN.md with exactly these sections:
 
@@ -30,10 +32,26 @@ Convert their transcript into a structured DESIGN.md with exactly these sections
 ## Architecture
 ## Components
 ## Data Flow
-## Open Questions
 
-Be concrete. Infer reasonable defaults where the user was vague. Flag ambiguities under Open Questions.
+Be concrete. Infer reasonable defaults where the user was vague.
 Output only the markdown — no preamble, no code fences around the whole document.
+"""
+
+AUDIT_SYSTEM_PROMPT = """\
+You are a senior software architect auditing a system design document written by a colleague.
+Your job is to surface problems and gather missing information.
+
+Identify:
+- Critical issues: missing components, inconsistencies, scalability risks, security gaps, unclear ownership
+- Follow-up questions: specific questions to ask the designer to clarify intent and fill gaps
+
+Return ONLY a JSON object — no prose, no markdown fences — in this exact shape:
+{
+  "issues": ["issue 1", "issue 2"],
+  "questions": ["question 1", "question 2"]
+}
+
+Aim for 3–7 issues and 3–7 questions. Be specific, not generic.
 """
 
 
@@ -42,10 +60,37 @@ class TranscriptRequest(BaseModel):
 
 
 async def generate_markdown(transcript: str) -> str:
-    config = LocalAgentConfig(system_instructions=SYSTEM_PROMPT)
+    config = LocalAgentConfig(system_instructions=DESIGN_SYSTEM_PROMPT)
     async with Agent(config) as agent:
         response = await agent.chat(transcript)
         return await response.text()
+
+
+async def run_audit(design_content: str) -> dict:
+    config = LocalAgentConfig(system_instructions=AUDIT_SYSTEM_PROMPT)
+    async with Agent(config) as agent:
+        response = await agent.chat(design_content)
+        raw = await response.text()
+    cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+    return json.loads(cleaned)
+
+
+@app.get("/audit")
+async def audit_design():
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set.")
+    if not DESIGN_MD.exists():
+        raise HTTPException(status_code=404, detail="DESIGN.md not found. Generate a design first.")
+    content = DESIGN_MD.read_text(encoding="utf-8").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="DESIGN.md is empty.")
+    try:
+        result = await run_audit(content)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Auditor returned invalid JSON: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Antigravity error: {e}")
+    return {"issues": result.get("issues", []), "questions": result.get("questions", [])}
 
 
 @app.get("/design-md")

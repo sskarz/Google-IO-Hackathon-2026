@@ -1,113 +1,116 @@
 # Overview
-This design document details a simple, full-stack web application that allows users to register, log in, and manage their user profiles. The application is designed to be lightweight, secure, and easy to run locally.
+The system enables users to safely register and log in to a web-based dashboard application. It provides a secure, lightweight, and scalable authentication backend using FastAPI, SQLite/PostgreSQL, and JSON Web Tokens (JWT). The infrastructure is designed to be fully modular, allowing for independent scaling of authentication and dashboard services.
 
 ## Goals
-* **User Authentication**: Secure user registration, login, and session management.
-* **Profile Management**: Capabilities to create, view, and update dynamic user profile details (e.g., full name, bio, and avatar).
-* **Simplified Tech Stack**: A unified, low-overhead setup combining a Python backend with zero external build-tooling requirements for the frontend.
-* **Persistent Storage**: Utilization of a relational database schemas with robust password hashing.
+- **Secure User Registration:** Allow new users to create accounts with email and password, ensuring password hashing using Argon2/bcrypt.
+- **Stateless Authentication:** Verify user identity via secure, short-lived JWT access tokens and longer-lived, HttpOnly refresh tokens.
+- **Dashboard Access Control:** Restrict dashboard endpoints to authenticated or authorized users only.
+- **Concrete Technical Defaults:** Use FastAPI, SQLite (for development) transitioning to PostgreSQL, and SQLAlchemy ORM for database representation.
+- **Developer-Friendly API Documentation:** Automatically expose interactive Swagger UI and ReDoc endpoints.
 
 ## Architecture
-The application uses a unified monolithic single-server architecture. The FastAPI backend serves both the transactional JSON APIs and the static frontend SPA (Single Page Application).
+The system adopts an API-first monolithic architectural style (highly modular) designed for fast, modern deployments:
+1. **Frontend Client:** Web dashboard (React/Vue/HTML5) that interacts with APIs via secure HTTPS.
+2. **API Gateway / Router (FastAPI):** Orchestrates routing, middleware (CORS, Rate Limiting), and dependency injection.
+3. **Authentication Layer:** Deals with credentials verification, password hashing, and token signing/validation.
+4. **Data Access Layer:** Uses SQLAlchemy ORM to communicate with the SQLite/PostgreSQL Database.
+5. **Database Layer:** Holds the relational data model for users, sessions, and dashboard resources.
 
 ```mermaid
 graph TD
-    Client["Browser client (HTML/JS)"] <-->|HTTP API / JWT| Backend["FastAPI Server"]
-    Backend <-->|SQLAlchemy ORM| DB[("SQLite Database<br>(backend.db)")]
+    User([User / Web Browser]) -->|HTTPS Request| FE[Frontend Client / Dashboard UI]
+    FE -->|API Call: JWT in Authorization Header| API[FastAPI Backend Server]
+    API -->|1. Route & Middleware| Cors[CORS / Rate Limiting Middleware]
+    API -->|2. Process Auth/Data Requests| Controllers[Auth & User Controllers]
+    Controllers -->|Authenticate / Verify Token| JWT[JWT Token Utility]
+    Controllers -->|Query / Mutate| ORM[SQLAlchemy ORM]
+    ORM -->|Read/Write Model| DB[(SQLite / PostgreSQL Database)]
 ```
-
-* **Frontend**: A clean, single-page application built on HTML5, Tailwind CSS (loaded via CDN), and vanilla JavaScript. Kept in a `/static` dir web-served directly by FastAPI.
-* **Backend**: FastAPI RESTful backend running with Uvicorn, structured to handle authorization routes, profile CRUD operations, and serve static assets.
-* **Database**: SQLite (SQLModel/SQLAlchemy) for zero-setup, lightweight data persistence.
 
 ## Components
-### 1. Frontend Client
-Composed of index files served statically:
-* **Authentication Screens**: Minimal signup and login forms with real-time field validation.
-* **User Dashboard & Profile Card**: A secure view featuring user-specific metadata and an editable profile configuration panel.
-* **API Bridge (`app.js`)**: Coordinates fetches to the FastAPI backend, controls state, and stores authorization tokens in `localStorage`.
+The infrastructure comprises the following Core Components:
 
-### 2. Backend Service ([main.py](file:///Users/epicgdog/Documents/projects/Google-IO-Hackathon-2026/backend/main.py))
-* **Application Initializer**: Registers endpoints and mounts static files.
-* **Authentication Router (`/api/auth`)**:
-  * `POST /api/auth/register`: Create a username/password record. Passwords are securely hashed with `bcrypt`/`passlib`.
-  * `POST /api/auth/token`: Performs authentication checks and returns a JWT access token.
-* **Profiles Router (`/api/profiles`)**:
-  * `GET /api/profiles/me`: Returns the active user's profile information.
-  * `PUT /api/profiles/me`: Updates profile details.
-* **Static SPA router (`/`)**: Fallback router to serve client index pages for unrecognized endpoints.
+1. **User Manager & AuthService:**
+   - **Responsibility:** Password hashing (using `passlib` with `bcrypt` backend), access/refresh token generation, and user validation logic.
+   - **Core API endpoints:**
+     - `POST /api/v1/auth/register` (Payload: `UserCreate` schema)
+     - `POST /api/v1/auth/login` (Payload: `OAuth2PasswordRequestForm`)
+     - `POST /api/v1/auth/refresh` (Payload: Refresh token)
 
-### 3. Database Layer
-Managed with SQLAlchemy or SQLModel schemas:
-* **Users Schema**:
-  * `id`: Integer (Primary Key)
-  * `username`: String (Unique, Indexed)
-  * `hashed_password`: String
-  * `created_at`: DateTime
-* **Profiles Schema**:
-  * `id`: Integer (Primary Key)
-  * `user_id`: Integer (Foreign Key -> Users.id)
-  * `full_name`: String (Nullable)
-  * `bio`: String (Nullable)
-  * `avatar_url`: String (Nullable)
-  * `updated_at`: DateTime
+2. **Dashboard Controller & User Routes:**
+   - **Responsibility:** Fetching user-specific dashboard insights and editing profile settings.
+   - **Core API endpoints:**
+     - `GET /api/v1/users/me` (Protected: Requires valid Bearer Token)
+     - `GET /api/v1/dashboard/stats` (Protected: Dashboard data tailored to the logged-in user)
+
+3. **Database Model (`User` Entity):**
+   - **Columns:**
+     - `id`: `UUID` (Primary Key, uniquely identifies the user)
+     - `email`: `String(255)` (Unique, Indexed, used as login identifier)
+     - `hashed_password`: `String` (Securely encrypted password hash)
+     - `is_active`: `Boolean` (Flags deactivated accounts)
+     - `created_at`: `DateTime` (Timestamp of creation)
+     - `updated_at`: `DateTime` (Timestamp of last update)
+
+4. **Dependency Injection & Security Rules:**
+   - `get_db`: Yields database sessions.
+   - `get_current_user`: Dependency that extracts, decodes, and validates the JWT Bearer-Token, fetching the user dynamically.
 
 ## Data Flow
-### User Registration & Authentication Flow
+
+### User Registration Flow
 ```mermaid
 sequenceDiagram
-    participant Browser as Frontend App
-    participant Auth as Auth Endpoints
-    participant DB as SQLite Database
-
-    Browser->>Auth: POST /api/auth/register (username, password)
-    Auth->>DB: Check if username exists
-    alt Username exists
-        Auth-->>Browser: 400 Bad Request
-    else Username is available
-        Auth->>Auth: Hash password with bcrypt
-        Auth->>DB: Save User & Profile records
-        DB-->>Auth: Saved
-        Auth-->>Browser: 201 Created
-    end
-
-    Browser->>Auth: POST /api/auth/token (username, password)
-    Auth->>DB: Read user hash
-    Auth->>Auth: Verify password match
-    alt Verification fails
-        Auth-->>Browser: 401 Unauthorized
-    else Verification succeeds
-        Auth->>Auth: Generate JWT with expiry
-        Auth-->>Browser: 200 OK (access_token)
+    autonumber
+    actor User as Client Browser
+    participant API as FastAPI Router
+    participant DB as SQLite / PostgreSQL Database
+    
+    User->>API: POST /api/v1/auth/register (email, password)
+    API->>API: Validate input schemas (Pydantic Validation)
+    API->>DB: Check if email already exists
+    alt Email exists
+        DB-->>API: User Record Found
+        API-->>User: HTTP 400 Bad Request (Email already registered)
+    else Email is unique
+        API->>API: Hash password via Bcrypt/Argon2
+        API->>DB: Insert new user (email, hashed_password)
+        DB-->>API: Return User model
+        API-->>User: HTTP 201 Created (user_id, email, is_active)
     end
 ```
 
-### Profile Retrieval & Update Flow
+### User Login & Dashboard Access Flow
 ```mermaid
 sequenceDiagram
-    participant Browser as Frontend App
-    participant ProfileAPI as Profile Endpoints
-    participant DB as SQLite Database
-
-    Browser->>ProfileAPI: GET /api/profiles/me (Authorization: Bearer <token>)
-    ProfileAPI->>ProfileAPI: Decode and validate JWT
-    alt Invalid/Expired Token
-        ProfileAPI-->>Browser: 401 Unauthorized
-    else Valid Token
-        ProfileAPI->>DB: Retrieve profile record using user_id
-        DB-->>ProfileAPI: Profile Data
-        ProfileAPI-->>Browser: 200 OK (Profile payload)
+    autonumber
+    actor User as Client Browser
+    participant API as FastAPI Router
+    participant DB as SQLite/PostgreSQL DB
+    
+    User->>API: POST /api/v1/auth/login (email, password)
+    API->>DB: Retrieve User record by email
+    alt User not found
+        DB-->>API: Null
+        API-->>User: HTTP 401 Unauthorized (Invalid credentials)
+    else User exists
+        API->>API: Compare raw password against hashed_password
+        alt Password matches
+            API->>API: Generate Access JWT (expires in 15m) & Refresh JWT
+            API-->>User: HTTP 200 OK (access_token, token_type, refresh_token)
+        else Password mismatch
+            API-->>User: HTTP 401 Unauthorized (Invalid credentials)
+        end
     end
-
-    Browser->>ProfileAPI: PUT /api/profiles/me (Authorization: Bearer <token>, Profile Payload)
-    ProfileAPI->>ProfileAPI: Validate JWT & payload parameters
-    ProfileAPI->>DB: Update profile column values
-    DB-->>ProfileAPI: Saved
-    ProfileAPI-->>Browser: 200 OK (Updated profile payload)
+    
+    Note over User, API: Accessing Restricted Dashboard
+    User->>API: GET /api/v1/dashboard/stats with Bearer [Access Token]
+    API->>API: Decode and verify JWT Signature & Expiry
+    alt JWT Token invalid or expired
+        API-->>User: HTTP 401 Unauthorized (Could not validate credentials)
+    else JWT Token is valid
+        API->>DB: Fetch specific user dashboard insights
+        DB-->>API: Return DB stats
+        API-->>User: HTTP 200 OK (Dashboard JSON data payload)
+    end
 ```
-
-## Open Questions
-1. **JWT Storage**: Should the frontend store access tokens in `localStorage` for visual code simplicity, or on HttpOnly, secure cookies to guard against Cross-Site Scripting (XSS) attacks?
-2. **Profile Avatars**: Will simple string-based URLs (or high-quality default emoji selections) satisfy the profile picture goal, or is custom image file-uploading required?
-3. **ORM Selection**: Do you prefer traditional `SQLAlchemy` schemas paired with native `Pydantic` models, or unified `SQLModel` libraries for rapid prototyping?
-4. **Environment Configuration**: Should we configure database path and security keys using a `.env` loader file, or default to standard in-memory parameters for starting?

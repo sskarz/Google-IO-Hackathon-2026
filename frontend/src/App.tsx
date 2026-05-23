@@ -4,6 +4,7 @@ import {
   type RecognitionMode,
 } from './hooks/useSpeechRecognition'
 import { DesignViewer } from './components/DesignViewer'
+import { AuditViewer } from './components/AuditViewer'
 import './App.css'
 
 type GenerateStatus = 'idle' | 'submitting' | 'success' | 'error'
@@ -200,6 +201,7 @@ function App() {
       </section>
 
       <DesignViewer refreshKey={refreshKey} />
+      <AuditViewer refreshKey={refreshKey} />
 
       {!isSupported && (
         <p className="unsupported-note">
