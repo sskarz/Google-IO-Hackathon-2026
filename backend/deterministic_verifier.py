@@ -246,7 +246,7 @@ def verify_generated_tests(workspace: Path) -> VerificationReport:
     required_patterns = {
         "POST create flow": r"\.post\s*\(",
         "GET read/list flow": r"\.get\s*\(",
-        "round-trip assertions": r"assert\s+.*\[\s*[\"'](?:id|user_id|email|username|name)[\"']\s*\]",
+        "round-trip assertions": r"assert\s+.*\[\s*[\"'](?:id|user_id|task_id|email|username|name|title|owner|status)[\"']\s*\]",
         "validation/error assertions": r"assert\s+.*status_code\s*==\s*4\d\d",
     }
     missing = [name for name, pattern in required_patterns.items() if not re.search(pattern, text)]
@@ -272,6 +272,10 @@ def verify_frontend_build(workspace: Path) -> VerificationReport:
     if not (frontend / "package.json").exists():
         return VerificationReport(success=True, test_summary="frontend build skipped; no package.json")
 
+    install = ensure_frontend_dependencies(frontend)
+    if not install.success:
+        return install
+
     result = run_command(["npm", "run", "build"], cwd=frontend, timeout=180)
     return VerificationReport(
         success=result.returncode == 0,
@@ -291,20 +295,22 @@ def verify_contract_e2e(workspace: Path) -> VerificationReport:
     frontend_port = int(config.get("frontend_port", 5173))
     backend_base = f"http://127.0.0.1:{backend_port}"
     frontend_base = f"http://127.0.0.1:{frontend_port}"
-    processes: list[subprocess.Popen[str]] = []
     transcript: list[str] = []
 
     try:
+        if (frontend / "package.json").exists():
+            install = ensure_frontend_dependencies(frontend)
+            if not install.success:
+                return install
+
         if not wait_for_url(f"{backend_base}/docs", timeout=1):
-            processes.append(
-                subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(backend_port)],
-                    cwd=backend,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
+            pid = start_persistent_process(
+                [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(backend_port)],
+                cwd=backend,
+                log_path=workspace / "backend.log",
+                pid_path=workspace / "backend.pid",
             )
+            transcript.append(f"Started backend on port {backend_port} with PID {pid}.")
         if not wait_for_url(f"{backend_base}/docs", timeout=20):
             return VerificationReport(
                 success=False,
@@ -314,15 +320,13 @@ def verify_contract_e2e(workspace: Path) -> VerificationReport:
             )
 
         if (frontend / "package.json").exists() and not wait_for_url(frontend_base, timeout=1):
-            processes.append(
-                subprocess.Popen(
-                    ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(frontend_port)],
-                    cwd=frontend,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
+            pid = start_persistent_process(
+                ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(frontend_port)],
+                cwd=frontend,
+                log_path=workspace / "frontend.log",
+                pid_path=workspace / "frontend.pid",
             )
+            transcript.append(f"Started frontend on port {frontend_port} with PID {pid}.")
 
         created_payload, sentinel = run_create_flow(contract, backend_base, transcript)
         run_get_flows(contract, backend_base, created_payload, sentinel, transcript)
@@ -347,19 +351,42 @@ def verify_contract_e2e(workspace: Path) -> VerificationReport:
             stdout="\n".join(transcript),
             reasons_for_failure=str(exc),
         )
-    finally:
-        for process in processes:
-            process.terminate()
-        for process in processes:
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
 
     return VerificationReport(
         success=True,
-        test_summary="contract-driven black-box E2E",
+        test_summary="contract-driven black-box E2E; services left running",
         stdout="\n".join(transcript),
+    )
+
+
+def start_persistent_process(command: list[str], cwd: Path, log_path: Path, pid_path: Path) -> int:
+    log_file = log_path.open("a")
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        text=True,
+    )
+    pid_path.write_text(str(process.pid))
+    log_file.close()
+    return process.pid
+
+
+def ensure_frontend_dependencies(frontend: Path) -> VerificationReport:
+    if (frontend / "node_modules" / ".bin" / "vite").exists():
+        return VerificationReport(success=True, test_summary="frontend dependencies already installed")
+
+    command = ["npm", "ci"] if (frontend / "package-lock.json").exists() else ["npm", "install"]
+    result = run_command(command, cwd=frontend, timeout=240)
+    return VerificationReport(
+        success=result.returncode == 0,
+        test_summary="frontend dependency installation",
+        stdout=result.stdout,
+        stderr=result.stderr,
+        reasons_for_failure=None if result.returncode == 0 else f"{' '.join(command)} exited with {result.returncode}",
     )
 
 
