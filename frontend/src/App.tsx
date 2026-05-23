@@ -1,9 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   useSpeechRecognition,
   type RecognitionMode,
 } from './hooks/useSpeechRecognition'
+import { DesignViewer } from './components/DesignViewer'
 import './App.css'
+
+type GenerateStatus = 'idle' | 'submitting' | 'success' | 'error'
 
 function App() {
   const [mode, setMode] = useState<RecognitionMode>('push-to-talk')
@@ -25,10 +28,54 @@ function App() {
     return f || i
   }, [finalTranscript, interimTranscript])
 
+  const [generateStatus, setGenerateStatus] = useState<GenerateStatus>('idle')
+  const [generateError, setGenerateError] = useState<string | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0)
+
+  const handleGenerate = useCallback(async (transcript: string) => {
+    if (!transcript.trim()) return
+    setGenerateStatus('submitting')
+    setGenerateError(null)
+    try {
+      const res = await fetch('http://localhost:8000/generate-design', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript: transcript.trim() }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail ?? `HTTP ${res.status}`)
+      }
+      setGenerateStatus('success')
+      setRefreshKey((k) => k + 1)
+    } catch (e) {
+      setGenerateError(e instanceof Error ? e.message : 'Unknown error')
+      setGenerateStatus('error')
+    }
+  }, [])
+
+  // Ref so the effect always calls the latest transcript without being in deps
+  const finalTranscriptRef = useRef(finalTranscript)
+  finalTranscriptRef.current = finalTranscript
+
+  // Flag set when user explicitly clicks Stop — cleared once generate fires
+  const autoGenerateRef = useRef(false)
+
   const handleToggle = () => {
-    if (isListening) stop()
-    else start()
+    if (isListening) {
+      autoGenerateRef.current = true
+      stop()
+    } else {
+      start()
+    }
   }
+
+  // Auto-generate when recording stops
+  useEffect(() => {
+    if (isListening || !autoGenerateRef.current) return
+    autoGenerateRef.current = false
+    handleGenerate(finalTranscriptRef.current)
+  }, [isListening, handleGenerate])
 
   const handleCopy = async () => {
     if (!fullTranscript) return
@@ -43,6 +90,7 @@ function App() {
     if (!isSupported) return 'Browser not supported'
     if (error) return `Error: ${error}`
     if (isListening) return mode === 'continuous' ? 'Listening continuously…' : 'Recording…'
+    if (generateStatus === 'submitting') return 'Updating DESIGN.md…'
     return mode === 'continuous' ? 'Tap to start streaming' : 'Tap and hold the floor — click again to stop'
   })()
 
@@ -85,7 +133,7 @@ function App() {
           type="button"
           className={`record-btn ${isListening ? 'recording' : ''}`}
           onClick={handleToggle}
-          disabled={!isSupported}
+          disabled={!isSupported || generateStatus === 'submitting'}
           aria-pressed={isListening}
           aria-label={isListening ? 'Stop recording' : 'Start recording'}
         >
@@ -145,8 +193,13 @@ function App() {
           <span className="char-count">
             {finalTranscript.length} characters captured
           </span>
+          {generateStatus === 'error' && (
+            <span className="generate-inline-error">Generate failed: {generateError}</span>
+          )}
         </footer>
       </section>
+
+      <DesignViewer refreshKey={refreshKey} />
 
       {!isSupported && (
         <p className="unsupported-note">

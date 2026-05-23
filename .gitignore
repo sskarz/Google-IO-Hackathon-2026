@@ -17,6 +17,9 @@ db.crypt
 .env.local
 .env.*.local
 
+# Generated artifacts
+DESIGN.md
+
 # Logs
 logs/
 *.log
