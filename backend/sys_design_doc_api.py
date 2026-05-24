@@ -9,6 +9,7 @@ from typing import Any, Literal
 import traceback
 from dataclasses import dataclass, field
 from google.antigravity import Agent, LocalAgentConfig
+from google.antigravity.hooks import policy
 
 logging.basicConfig(level=logging.INFO)
 
@@ -977,3 +978,92 @@ async def auditor_ws(websocket: WebSocket):
                 }))
             except Exception:
                 pass
+
+
+# ── GCP Deployment ────────────────────────────────────────────────────────────
+
+class DeployGCPRequest(BaseModel):
+    gcp_project_id: str | None = None
+    gcp_region: str | None = "us-central1"
+    service_name: str | None = "google-io-app"
+    deploy_backend: bool = True
+    deploy_frontend: bool = True
+
+class DeployGCPResponse(BaseModel):
+    success: bool
+    message: str
+    agent_thoughts: str | None = None
+    agent_output: str | None = None
+
+@app.post("/deploy-to-gcp", response_model=DeployGCPResponse)
+async def deploy_to_gcp(body: DeployGCPRequest):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set.")
+    
+    # Locate gcp-credentials.json
+    gcp_credentials_path = BACKEND_ROOT / "gcp-credentials.json"
+    if not gcp_credentials_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="gcp-credentials.json not found in the backend root directory."
+        )
+
+    # Prepare GCP deployment instructions
+    project_id = body.gcp_project_id or "gen-lang-client-0732803191"
+    prompt = f"""
+    Deploy the generated application located in the workspace to Google Cloud Platform (GCP).
+    
+    Project Configurations:
+    - GCP Project ID: {project_id}
+    - GCP Region: {body.gcp_region}
+    - Service Name: {body.service_name}
+    - Deploy Backend: {body.deploy_backend}
+    - Deploy Frontend: {body.deploy_frontend}
+    
+    Instructions:
+    1. Authenticate with GCP using the service account credentials in `{gcp_credentials_path}`.
+       (e.g., using `gcloud auth activate-service-account --key-file={gcp_credentials_path}`).
+    2. Set the active GCP project using `gcloud config set project {project_id}`.
+    3. If deploy_backend is True, verify or package the FastAPI backend and deploy it to Google Cloud Run.
+    4. If deploy_frontend is True, build the Vite/React frontend and deploy it to Google Cloud Run or Google Cloud Storage static website hosting.
+    5. Summarize the deployment actions, including any created resources and live URLs.
+    """
+
+    system_instructions = (
+        "You are an expert GCP DevOps engineer and cloud architect. Your task is to deploy "
+        "the application workspace to GCP using available command line tools (gcloud, docker, npm, etc.). "
+        "Be efficient and report the deployment details clearly."
+    )
+
+    # Use the Antigravity SDK Agent
+    config = LocalAgentConfig(
+        system_instructions=system_instructions,
+        policies=[policy.allow_all()]
+    )
+
+    try:
+        async with Agent(config=config) as agent:
+            response = await agent.chat(prompt)
+            agent_output = await response.text()
+            
+            thoughts_list = []
+            async for t in response.thoughts:
+                thoughts_list.append(t)
+            agent_thoughts = "".join(thoughts_list)
+
+        return DeployGCPResponse(
+            success=True,
+            message="Deployment flow executed successfully.",
+            agent_thoughts=agent_thoughts,
+            agent_output=agent_output
+        )
+    except Exception as e:
+        logging.error(f"GCP deployment agent error: {e}\n{traceback.format_exc()}")
+        return DeployGCPResponse(
+            success=False,
+            message=f"Deployment flow failed: {str(e)}",
+            agent_thoughts=None,
+            agent_output=None
+        )
+
